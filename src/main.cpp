@@ -42,6 +42,11 @@ uint8_t age[W * H];
 
 // Global hue shift
 uint16_t hueShift = 0;
+static bool paused = false;
+
+// Zoom viewport origin for 2x/4x modes (wraps around the toroidal grid).
+static int viewX = 0;
+static int viewY = 0;
 
 // Styles
 int currentStyle = 0;
@@ -188,10 +193,32 @@ uint16_t fireColor(uint8_t v) {
     );
 }
 
+static inline bool styleUsesAge() {
+    // Styles that look best when using the "strongest" age in a block.
+    return (currentStyle == 2) || (currentStyle == 3) || (currentStyle == 5);
+}
+
+static inline uint16_t styleColorAt(int x, int y, uint8_t ageVal) {
+    switch (currentStyle) {
+        case 0: // White
+            return 0xFFFF;
+        case 1: // Rainbow hue cycling
+            return hsvTo565((hueShift + x + y) % 360, 255, 255);
+        case 2: // Heatmap
+            return heatColor(ageVal);
+        case 3: // Neon trails
+            return neonColor(ageVal);
+        case 4: // Plasma
+            return plasmaColor(x, y);
+        case 5: // Fire
+            return fireColor(ageVal);
+        default:
+            return 0xFFFF;
+    }
+}
+
 // 1x Render
 void renderToFramebuffer() {
-    hueShift = (hueShift + 1) % 360;
-
     for (int y = 0; y < H; y++) {
         for (int x = 0; x < W; x++) {
             bool alive = getCell(grid, x, y);
@@ -202,132 +229,31 @@ void renderToFramebuffer() {
                 continue;
             }
 
-            switch (currentStyle) {
-                case 0: // White
-                    framebuffer[i] = 0xFFFF;
-                    break;
-                case 1: // Rainbow hue cycling
-                    framebuffer[i] = hsvTo565((hueShift + x + y) % 360, 255, 255);
-                    break;
-                case 2: // Heatmap
-                    framebuffer[i] = heatColor(age[i]);
-                    break;
-                case 3: // Neon trails
-                    framebuffer[i] = neonColor(age[i]);
-                    break;
-                case 4: // Plasma
-                    framebuffer[i] = plasmaColor(x, y);
-                    break;
-                case 5: // Fire
-                    framebuffer[i] = fireColor(age[i]);
-                    break;
-                default:
-                    framebuffer[i] = 0xFFFF; // fallback
-                    break;
-            }
+            framebuffer[i] = styleColorAt(x, y, age[i]);
         }
     }
 }
 
 // 2x Render
 void renderToFramebuffer2x() {
-    hueShift = (hueShift + 1) % 360;
+    // 2x zoom: show a 64x64 viewport scaled to fill 128x128.
+    for (int sy = 0; sy < 64; sy++) {
+        for (int sx = 0; sx < 64; sx++) {
+            const int gx = (viewX + sx) & 127;
+            const int gy = (viewY + sy) & 127;
+            const bool alive = getCell(grid, gx, gy);
 
-    for (int y = 0; y < H; y++) {
-        for (int x = 0; x < W; x++) {
-
-            bool alive = getCell(grid, x, y);
-            uint16_t color;
-
-            if (!alive) {
-                color = 0x0000;
-            } else {
-                int i = idx(x, y);
-                switch (currentStyle) {
-                    case 0: color = 0xFFFF; break; // White
-                    case 1: color = hsvTo565((hueShift + x + y) % 360, 255, 255); break;
-                    case 2: color = heatColor(age[i]); break;
-                    case 3: color = neonColor(age[i]); break;
-                    case 4: color = plasmaColor(x, y); break;
-                    case 5: color = fireColor(age[i]); break;
-                    default: color = 0xFFFF; break;
-                }
+            uint16_t color = 0x0000;
+            if (alive) {
+                color = styleColorAt(gx, gy, age[idx(gx, gy)]);
             }
 
-            // --- 2×2 pixel scaling ---
-            int sx = x * 2;
-            int sy = y * 2;
-
-            if (sx < W-1 && sy < H-1) {
-                framebuffer[idx(sx,     sy    )] = color;
-                framebuffer[idx(sx + 1, sy    )] = color;
-                framebuffer[idx(sx,     sy + 1)] = color;
-                framebuffer[idx(sx + 1, sy + 1)] = color;
-            }
-        }
-    }
-}
-
-
-// Alternate 2x Render
-void renderToFramebuffer2xAlt() {
-    hueShift = (hueShift + 1) % 360;
-
-    // We render in 2×2 blocks, so we step by 2
-    for (int y = 0; y < H; y += 2) {
-        for (int x = 0; x < W; x += 2) {
-
-            // Determine block state from 4 simulation cells
-            bool alive =
-                getCell(grid, x,     y    ) ||
-                getCell(grid, x + 1, y    ) ||
-                getCell(grid, x,     y + 1) ||
-                getCell(grid, x + 1, y + 1);
-
-            uint16_t color;
-
-            if (!alive) {
-                color = 0x0000; // black
-            } else {
-                // Use the top-left cell for age-based styles
-                int i = idx(x, y);
-
-                switch (currentStyle) {
-                    case 0: // White
-                        color = 0xFFFF;
-                        break;
-
-                    case 1: // Rainbow hue cycling
-                        color = hsvTo565((hueShift + x + y) % 360, 255, 255);
-                        break;
-
-                    case 2: // Heatmap
-                        color = heatColor(age[i]);
-                        break;
-
-                    case 3: // Neon trails
-                        color = neonColor(age[i]);
-                        break;
-
-                    case 4: // Plasma
-                        color = plasmaColor(x, y);
-                        break;
-
-                    case 5: // Fire
-                        color = fireColor(age[i]);
-                        break;
-
-                    default:
-                        color = 0xFFFF;
-                        break;
-                }
-            }
-
-            // Draw the 2×2 block
-            framebuffer[idx(x,     y    )] = color;
-            framebuffer[idx(x + 1, y    )] = color;
-            framebuffer[idx(x,     y + 1)] = color;
-            framebuffer[idx(x + 1, y + 1)] = color;
+            const int dx = sx * 2;
+            const int dy = sy * 2;
+            framebuffer[idx(dx,     dy    )] = color;
+            framebuffer[idx(dx + 1, dy    )] = color;
+            framebuffer[idx(dx,     dy + 1)] = color;
+            framebuffer[idx(dx + 1, dy + 1)] = color;
         }
     }
 }
@@ -335,53 +261,24 @@ void renderToFramebuffer2xAlt() {
 
 // 4x Render
 void renderToFramebuffer4x() {
-    hueShift = (hueShift + 1) % 360;
+    // 4x zoom: show a 32x32 viewport scaled to fill 128x128.
+    for (int sy = 0; sy < 32; sy++) {
+        for (int sx = 0; sx < 32; sx++) {
+            const int gx = (viewX + sx) & 127;
+            const int gy = (viewY + sy) & 127;
+            const bool alive = getCell(grid, gx, gy);
 
-    for (int y = 0; y < H; y++) {
-        for (int x = 0; x < W; x++) {
-
-            bool alive = getCell(grid, x, y);
-            uint16_t color;
-
-            if (!alive) {
-                color = 0x0000;
-            } else {
-                int i = idx(x, y);
-                switch (currentStyle) {
-                    case 0: color = 0xFFFF; break; // White
-                    case 1: color = hsvTo565((hueShift + x + y) % 360, 255, 255); break;
-                    case 2: color = heatColor(age[i]); break;
-                    case 3: color = neonColor(age[i]); break;
-                    case 4: color = plasmaColor(x, y); break;
-                    case 5: color = fireColor(age[i]); break;
-                    default: color = 0xFFFF; break;
-                }
+            uint16_t color = 0x0000;
+            if (alive) {
+                color = styleColorAt(gx, gy, age[idx(gx, gy)]);
             }
 
-            // --- 4×4 pixel scaling ---
-            int sx = x * 4;
-            int sy = y * 4;
-
-            if (sx < W-3 && sy < H-3) {
-                framebuffer[idx(sx,     sy    )] = color;
-                framebuffer[idx(sx + 1, sy    )] = color;
-                framebuffer[idx(sx + 2, sy    )] = color;
-                framebuffer[idx(sx + 3, sy    )] = color;
-
-                framebuffer[idx(sx,     sy + 1)] = color;
-                framebuffer[idx(sx + 1, sy + 1)] = color;
-                framebuffer[idx(sx + 2, sy + 1)] = color;
-                framebuffer[idx(sx + 3, sy + 1)] = color;
-
-                framebuffer[idx(sx,     sy + 2)] = color;
-                framebuffer[idx(sx + 1, sy + 2)] = color;
-                framebuffer[idx(sx + 2, sy + 2)] = color;
-                framebuffer[idx(sx + 3, sy + 2)] = color;
-
-                framebuffer[idx(sx,     sy + 3)] = color;
-                framebuffer[idx(sx + 1, sy + 3)] = color;
-                framebuffer[idx(sx + 2, sy + 3)] = color;
-                framebuffer[idx(sx + 3, sy + 3)] = color;
+            const int dx = sx * 4;
+            const int dy = sy * 4;
+            for (int yy = 0; yy < 4; yy++) {
+                for (int xx = 0; xx < 4; xx++) {
+                    framebuffer[idx(dx + xx, dy + yy)] = color;
+                }
             }
         }
     }
@@ -513,12 +410,93 @@ void updateFPS() {
     }
 }
 
+static void clearHistoryFrames() {
+    for (int i = 0; i < HISTORY; i++) {
+        memset(history[i], 0, sizeof(history[i]));
+    }
+    historyIndex = 0;
+}
+
+static void printControls() {
+    Serial.println();
+    Serial.println("GoL controls:");
+    Serial.println("  r = next render");
+    Serial.println("  e = next style");
+    Serial.println("  n = reseed grid");
+    Serial.println("  p = pause/resume");
+    Serial.println("  w/a/s/d = pan viewport (2x/4x)");
+    Serial.println("  h/? = help");
+    Serial.println();
+}
+
+static void handleSerialControls() {
+    static bool printedOnFirstInput = false;
+    while (Serial.available() > 0) {
+        if (!printedOnFirstInput) {
+            // If the serial monitor attaches after boot, the user may miss the boot-time help.
+            printControls();
+            printedOnFirstInput = true;
+        }
+
+        const char c = (char)Serial.read();
+        switch (c) {
+            case 'r':
+            case 'R':
+                currentRender = (currentRender + 1) % NUM_RENDERS;
+                Serial.print("Render: ");
+                Serial.println(renderNames[currentRender]);
+                break;
+            case 'e':
+            case 'E':
+                currentStyle = (currentStyle + 1) % NUM_STYLES;
+                Serial.print("Style: ");
+                Serial.println(styleNames[currentStyle]);
+                break;
+            case 'n':
+            case 'N':
+                randomizeGrid();
+                clearHistoryFrames();
+                Serial.println("Reseeded grid.");
+                break;
+            case 'p':
+            case 'P':
+                paused = !paused;
+                Serial.print("Paused: ");
+                Serial.println(paused ? "yes" : "no");
+                break;
+            case 'w':
+            case 'W':
+                viewY = (viewY - 1) & 127;
+                break;
+            case 's':
+            case 'S':
+                viewY = (viewY + 1) & 127;
+                break;
+            case 'a':
+            case 'A':
+                viewX = (viewX - 1) & 127;
+                break;
+            case 'd':
+            case 'D':
+                viewX = (viewX + 1) & 127;
+                break;
+            case 'h':
+            case 'H':
+            case '?':
+                printControls();
+                break;
+            default:
+                break;
+        }
+    }
+}
+
 void setup() {
     Serial.begin(115200);
     display.begin();
     display.fillScreen(0);
 
-    pinMode(33, INPUT);   // 5v sense
+    pinMode(33, INPUT);   // 5V sense (digital input, not ADC)
 
     pinMode(17, OUTPUT);
     digitalWrite(17, HIGH);   // enable LDO2 (powers NeoPixel)
@@ -530,50 +508,55 @@ void setup() {
     analogReadResolution(12);                 // 0–4095
     analogSetPinAttenuation(10, ADC_11db);    // allow up to ~3.3V input
 
-    for (int i = 0; i < HISTORY; i++) {
-        memset(history[i], 0, sizeof(history[i]));
-    }
+    clearHistoryFrames();
     memset(age, 0, sizeof(age));
 
     randomSeed(esp_random());
     randomizeGrid();
     currentStyle = random(0, NUM_STYLES);
     currentRender = random(0, NUM_RENDERS);
-    sleep(1);
+    delay(1000);
     Serial.print("Selected style: ");
     Serial.println(styleNames[currentStyle]);
     Serial.print("Selected render: ");
     Serial.println(renderNames[currentRender]);
+    printControls();
 }
 
 void loop() {
-    stepLife();
+    handleSerialControls();
 
-    // --- Multi-frame cycle detection ---
-    bool cycleDetected = false;
+    if (!paused) {
+        hueShift = (hueShift + 1) % 360;
+        stepLife();
 
-    // Compare current grid against all history frames
-    for (int i = 0; i < HISTORY; i++) {
-        if (memcmp(grid, history[i], sizeof(grid)) == 0) {
-            cycleDetected = true;
-            break;
+        // --- Multi-frame cycle detection ---
+        bool cycleDetected = false;
+
+        // Compare current grid against all history frames
+        for (int i = 0; i < HISTORY; i++) {
+            if (memcmp(grid, history[i], sizeof(grid)) == 0) {
+                cycleDetected = true;
+                break;
+            }
         }
+
+        if (isExtinct(grid) || cycleDetected) {
+            randomizeGrid();
+            clearHistoryFrames();
+            currentStyle = random(0, NUM_STYLES);
+            currentRender = random(0, NUM_RENDERS);
+
+            Serial.print("Restart triggered — new style: ");
+            Serial.println(styleNames[currentStyle]);
+            Serial.print("New render: ");
+            Serial.println(renderNames[currentRender]);
+        }
+
+        // Store current grid into history
+        memcpy(history[historyIndex], grid, sizeof(grid));
+        historyIndex = (historyIndex + 1) % HISTORY;
     }
-
-    if (isExtinct(grid) || cycleDetected) {
-        randomizeGrid();
-        currentStyle = random(0, NUM_STYLES);
-        currentRender = random(0, NUM_RENDERS);
-
-        Serial.print("Restart triggered — new style: ");
-        Serial.println(styleNames[currentStyle]);
-        Serial.print("New render: ");
-        Serial.println(renderNames[currentRender]);
-    }
-
-    // Store current grid into history
-    memcpy(history[historyIndex], grid, sizeof(grid));
-    historyIndex = (historyIndex + 1) % HISTORY;
 
     switch (currentRender) {
         case 0: renderToFramebuffer(); break;

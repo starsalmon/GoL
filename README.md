@@ -5,10 +5,21 @@ Conway’s Game of Life, rendered full-screen on a 128×128 SSD1351 SPI OLED, wi
 ## Features
 
 - Multiple styles (white, rainbow, heatmap, neon trails, plasma, fire)
-- 1× / 2× / 4× render modes
+- 1× / 2× / 4× render modes (2×/4× are “chunkier” downsampled modes)
 - Auto-reseed on extinction / repeating cycles
 - Optional NeoPixel “breathing” indicator (speeds up when charging)
 - Simple battery voltage sampling + filtered percentage-to-colour mapping
+
+## Controls (Serial)
+
+Open the serial monitor at 115200 baud (type any key once to print the help):
+
+- **r**: next render mode
+- **e**: next style
+- **n**: reseed grid
+- **p**: pause/resume
+- **h** or **?**: show help
+- **w/a/s/d**: pan viewport (2× / 4× modes)
 
 ## Hardware
 
@@ -31,7 +42,7 @@ Defined in `src/main.cpp`:
   - Power enable = GPIO **17** (drives LDO2 enable HIGH in `setup()`)
 - **Battery / power sense**
   - VBAT ADC = GPIO **10** (`analogRead(10)`, with a calibrated scale factor in code)
-  - 5V sense = GPIO **33** (`digitalRead(33) == HIGH` means “charging / 5V present”)
+  - 5V sense (digital) = GPIO **33** (`digitalRead(33) == HIGH` means “charging / 5V present”)
 
 If your wiring differs, change the defines and pin numbers at the top of `src/main.cpp`.
 
