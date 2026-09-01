@@ -1,0 +1,26 @@
+---
+description: Never OTA-flash a bot while it is moving — stop first
+alwaysApply: true
+---
+
+# OTA safety — bot must be stopped
+
+**Never start an OTA firmware upload while a bot is moving or may move.**
+
+OTA reboots the ESP mid-flash. A moving rover/mini with a bricked or half-flashed MCU is dangerous (wall, furniture, feet).
+
+## Before any OTA (`pio run …_ota -t upload`)
+
+1. **Stop motion** — zero `cmd_vel`, stop brain containers (`fleet-brain`, `rover-brain`), or confirm Cain has E-stop / power off motors.
+2. **Confirm stationary** — wheels not spinning; bot on bench or Cain says it's safe.
+3. **Ask if unsure** — "Is the bot stopped and safe to flash?"
+
+## If Cain says the bot is driving
+
+- **Do not flash.** Wait, or help stop it first.
+- USB flash is also unsafe while driving — same rule applies.
+
+## After OTA
+
+- Bot reboots and reconnects WiFi — expect ~30s–5min upload + reboot.
+- Do not start autonomous driving until Cain approves post-flash checks.

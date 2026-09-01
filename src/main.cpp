@@ -4,6 +4,7 @@
 #include <Adafruit_SSD1351.h>
 #include <Adafruit_NeoPixel.h>
 
+#define LDO2_EN   17
 #define OLED_CS   5
 #define OLED_DC   4
 #define OLED_RST  2
@@ -496,10 +497,10 @@ void setup() {
     display.begin();
     display.fillScreen(0);
 
-    pinMode(33, INPUT);   // 5V sense (digital input, not ADC)
+    pinMode(33, INPUT);   // 5V sense
 
-    pinMode(17, OUTPUT);
-    digitalWrite(17, HIGH);   // enable LDO2 (powers NeoPixel)
+    pinMode(LDO2_EN, OUTPUT);
+    digitalWrite(LDO2_EN, HIGH);   // enable LDO2 (powers OLED)
 
     pixels.begin();
     pixels.show();

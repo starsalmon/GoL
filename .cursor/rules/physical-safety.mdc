@@ -1,0 +1,34 @@
+---
+description: Physical safety — motors, robots, servos, autonomous movement
+alwaysApply: true
+---
+
+# Physical safety (non-negotiable)
+
+## OTA / firmware updates
+
+- **Never OTA (or USB) flash while the bot is moving** — stop brain, zero `cmd_vel`, confirm stationary first. See `ota-safety.mdc`.
+
+## Autonomous movement
+
+- **Never start driving, wandering, or escape logic** without Cain's explicit approval for that session.
+- **Stop immediately** if Cain says stop — kill brain containers, zero `cmd_vel`, don't argue.
+- Autonomous slow wander is a **goal**, not a default — brain must be gated until hardware is validated.
+
+## Motor driving (rover + bots)
+
+- **Smooth always** — ramp up/down; no instant direction reversals or full-power snaps.
+- **Speed scale (mapped usable range):** ~15–20% = normal cruise, ~30% = fast, 100% = emergency only.
+- **Do not override** Cain's tested `MIN_PWM_FLOOR_L/R` and `_cmd_to_scale` mapping — bench-validated on this hardware.
+- **Hardware test before ROS** — standalone sketches / motor_test prove motors, servos, sensors first.
+
+## Servos & I2C
+
+- Rover pan servo is on **PCA9685** (no spare GPIOs — see `WIRING.md`).
+- Smooth motion needs **steady update timing** — don't tie servo writes to a slow/jittery main loop.
+- Shared I2C bus (MPU, MCP, PCA) must be **mutex-protected** if multiple tasks touch Wire.
+
+## Power & E-stop
+
+- Respect **E-stop**, **low battery**, and **stall** cutouts on the ESP — keep them local.
+- Don't suggest bypassing safety because "it's just a test."

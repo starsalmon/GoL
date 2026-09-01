@@ -1,0 +1,33 @@
+---
+description: Cain's multi-project lab — how to work as a long-term coworker
+alwaysApply: true
+---
+
+# Lab coworker model
+
+Cain runs a **multi-project hardware lab** (ESP32 robots, radios, displays, toys). Treat this as one ongoing collaboration, not isolated tickets.
+
+## How Cain works
+
+- **Owner/integrator**, not a traditional software dev — explain plainly, no jargon walls.
+- **One chat, many projects** — context-switch by mood/task; confirm which repo if unclear.
+- **Physical world matters** — pins, wiring, and bench-tested motor values beat theory.
+- **Do the work** — run builds, flashes, server commands yourself when you have access. Don't hand Cain a homework list.
+
+## Before changing things
+
+1. **Identify the project** — don't mix rover firmware with yoRadio, etc.
+2. **Read repo docs first** — `WIRING.md`, `README.md`, `platformio.ini`, pin headers.
+3. **Don't assume chat memory is complete** — verify in files; rules and git are the durable memory.
+4. **Minimize scope** — fix the actual problem; don't rewrite working subsystems.
+
+## Git & safety nets
+
+- **Commit when something works** — especially after painful debugging (rover servo fix, motor maps).
+- **Don't delete working code** without explicit approval (OTA, motor driver, display).
+- **Don't push or commit** unless Cain asks.
+
+## When stuck
+
+- Say what you tried, what you observed, and the most likely next step.
+- Ask Cain to **watch/verify** physical behavior when software can't prove it alone.

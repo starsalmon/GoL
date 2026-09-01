@@ -1,0 +1,27 @@
+---
+description: Robot features are built-in personality — not manual shell scripts
+alwaysApply: true
+---
+
+# Robot personality — integrated behavior, not CLI jank
+
+Cain shows these robots to people. They must **just work** from physical inputs on the bot — buttons, sensors, time of day — without opening a laptop or remembering shell commands.
+
+## Do
+
+- Add behavior as **part of the robot's firmware or always-on brain** (ROS node, service, docker compose default stack).
+- Trigger from **on-bot inputs**: Go button, E-stop, IR, sonar, IMU, battery, schedule.
+- Use **separate PlatformIO envs** only for bench/hardware bring-up (`motor_test`, `c3_bench`, `s3_min`) — that's fine.
+- Brain logic lives on **dockerhost** as services that start with the fleet — not one-off scripts Cain must run.
+
+## Don't
+
+- Don't ship features as **standalone scripts** that require `ssh`, `docker compose --profile`, or memorized bash to demo.
+- Don't add "run this first, then that" runbooks for normal operation.
+- Don't make Cain the sysadmin during a demo — the robot should wake up and do its thing.
+
+## When adding a feature, ask
+
+> Can someone press Go (or equivalent) and see this work without a terminal?
+
+If no — redesign it into firmware, the default brain container, or an automatic trigger (sensor, timer, session state).

@@ -1,0 +1,37 @@
+---
+description: What each repo in this workspace is for
+alwaysApply: true
+---
+
+# Project map (cursor-esp32 workspace)
+
+| Repo | What it is |
+|------|------------|
+| **lego-rover-esp32** | LEGO rover firmware — LilyGO T-Display S3, motors, IMU, sonar pan, IR, display, OTA |
+| **lego-rover-ros2** | Fleet brain on **dockerhost** (Docker/ROS 2 Jazzy) — wander, logging, coordination. **No Pi.** |
+| **c3-mini-bot** | Small ESP32-C3 swarm bots — thin clients, namespaced topics, fleet via dockerhost |
+| **yoRadio-fusion-pros3** | yoRadio fork — Fusion Pro S3 internet radio, display, MQTT, NeoStatus |
+| **BT-A2DP-Source-HiGrow** | Bluetooth A2DP audio source |
+| **GIFPlayer** | GIF playback on ESP display |
+| **GoL** | Game of Life (display toy) |
+| **Magic-8-Ball** / **Magic-GIF-Ball** | Magic 8 ball variants |
+| **NFCNoisy** | NFC-triggered noise toy |
+| **lego-roverquest** | Rover-related experiment/quest code |
+
+## Fleet architecture (long-term goal)
+
+- **dockerhost** = brain (ROS 2 Jazzy + micro-ROS agent UDP **8888**).
+- Each bot = **thin ESP client** (motors/servos, sensors, local safety, WiFi micro-ROS).
+- **bot0** = LEGO rover (`/rover/…`), **bot1+** = c3-minis (`/bot1/…`, unique `BOT_NAMESPACE`).
+- Future: **IR pulse patterns** (not 38 kHz TSOP) for bot-to-bot cues.
+- Rover agent IP: check `platformio_private.ini` / env flags (e.g. `192.168.2.31`).
+
+## Key docs (read before guessing pins or architecture)
+
+| Doc | Covers |
+|-----|--------|
+| `lego-rover-esp32/WIRING.md` | Rover pins, I2C bus, motors, sonar, PCA9685, power |
+| `lego-rover-ros2/WIRING.md` | Pi legacy GPIO (buzzer/ring); ESP owns motors/IR/servo |
+| `lego-rover-ros2/ROVER_BEHAVIOR.md` | Priority ladder, cmd_vel, escape split ESP vs brain |
+| `c3-mini-bot/WIRING.md` | C3 pins, direct GPIO servos, sonar, TSOP |
+| `c3-mini-bot/docs/SWARM.md` | Fleet IDs, dockerhost stack, IR beacon chase |
