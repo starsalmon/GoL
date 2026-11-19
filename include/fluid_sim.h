@@ -8,28 +8,32 @@
 // (Müller's Ten Minute Physics method). Positions are in cell units,
 // +X right, +Y down. Gravity is passed in already mapped to screen axes.
 //
-// Interior tank is 80 x 60 cells (4 screen pixels each) so the fluid
-// fills the 320x240 panel. Hot buffers prefer internal RAM.
+// Interior tank is 64 x 48 cells (5 screen pixels each) so the fluid
+// fills the 320x240 panel. That is a bit finer than yoRadio's 46x34
+// screensaver grid, coarse enough (with a core-0 solver task) to
+// target ~30 fps. Hot buffers prefer internal RAM.
 
 class FluidSim {
  public:
-    static const int kNX = 82;           // interior 80 + solid ring
-    static const int kNY = 62;
-    static const int kInteriorX = 80;
-    static const int kInteriorY = 60;
+    static const int kNX = 66;           // interior 64 + solid ring
+    static const int kNY = 50;
+    static const int kInteriorX = 64;
+    static const int kInteriorY = 48;
     static const int kCells = kNX * kNY;
-    static const int kMaxParticles = 2800;
+    static const int kMaxParticles = 1800;
 
-    bool begin(int particleCount = 2400, float flipRatio = 0.90f);
+    bool begin(int particleCount = 1600, float flipRatio = 0.90f);
     void reseed();
     void stir();
     void step(float gx, float gy, float dt);
     // Colour by velocity (hue) and depth (brightness). Writes SCREEN pixels.
     void render(uint16_t* framebuffer, int screenW, int screenH);
-    // Build the 80x60 colour field once per frame, then blit one screen band
-    // (for ping-pong DMA). swapBytes pre-swaps for the ILI9341.
-    void prepareColors();
-    void renderBand(uint16_t* dest, int y0, int h, int screenW, bool swapBytes);
+    // Build the 64x48 colour field into dest (or the internal buffer).
+    void prepareColors(uint16_t* dest = nullptr);
+    // Blit one screen band, bilinear-upsampled to 2x2 pixel blocks
+    // (yoRadio screensaver style). swapBytes pre-swaps for the ILI9341.
+    void renderBand(uint16_t* dest, int y0, int h, int screenW, bool swapBytes,
+                    const uint16_t* colors = nullptr);
 
     int count() const { return count_; }
     bool ready() const { return ready_; }
@@ -45,6 +49,7 @@ class FluidSim {
     void updateDensity();
     void solvePressure(float dt);
     void zeroSolidFaces();
+    void prepareSolverCells();
     float faceHasFluid(int i, int j, int component) const;
     int idx(int i, int j) const { return i * kNY + j; }
 
@@ -81,7 +86,24 @@ class FluidSim {
     int* firstCell_ = nullptr;
     int* cellIds_ = nullptr;
 
-    // 80x60 colour field, reused each frame for the upsample.
+    // Cached P->G stencils, reused by G->P (Vateva). Two components.
+    struct TransferStencil {
+        int base;
+        float w00, w10, w11, w01;
+    };
+    TransferStencil* stenU_ = nullptr;
+    TransferStencil* stenV_ = nullptr;
+
+    // Wall coefficients hoisted out of the pressure iteration loop (Vateva).
+    struct SolverCell {
+        int index;
+        float divOff;
+        float fL, fR, fD, fU;
+    };
+    SolverCell* solverCells_ = nullptr;
+    int solverCount_ = 0;
+
+    // 64x48 colour field, used when prepareColors() is called without a dest.
     uint16_t* cellColor_ = nullptr;
 };
 

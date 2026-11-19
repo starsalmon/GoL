@@ -4,6 +4,8 @@
 
 #if defined(__GNUC__) && !defined(__clang__)
 #pragma GCC optimize("O3")
+#pragma GCC optimize("fast-math")
+#pragma GCC optimize("unroll-loops")
 #endif
 
 #include "fluid_sim.h"
@@ -20,10 +22,11 @@ const int FLUID = 1;
 const int SOLID = 2;
 
 const float kParticleRadius = 0.46f;
-const float kGravityAccel = 160.0f;   // cells / s^2 at 1 g (~640 px/s^2)
-const float kMaxSpeed = 48.0f;        // 0.8 cell per 1/60 s frame
+// Keep the same screen-space gravity as the old 80x60 tank (640 px/s^2).
+const float kGravityAccel = 128.0f;   // cells / s^2 at 1 g, 64-cell width
+const float kMaxSpeed = 38.4f;
 const int kPressureIters = 6;
-const int kSeparateIters = 2;
+const int kSeparateIters = 1;
 const float kInvOpen[5] = {0.0f, 1.0f, 0.5f, 1.0f / 3.0f, 0.25f};
 const float kTinyD2 = 1.0e-8f;
 
@@ -120,6 +123,10 @@ bool FluidSim::begin(int particleCount, float flipRatio) {
         ok = ok && hot((void**)&numCell_, sizeof(int) * hashCells);
         ok = ok && hot((void**)&firstCell_, sizeof(int) * (hashCells + 1));
         ok = ok && hot((void**)&cellIds_, sizeof(int) * kMaxParticles);
+        // Stencils and the solver-cell list are per-step scratch; prefer IRAM.
+        ok = ok && hot((void**)&stenU_, sizeof(TransferStencil) * kMaxParticles);
+        ok = ok && hot((void**)&stenV_, sizeof(TransferStencil) * kMaxParticles);
+        ok = ok && hot((void**)&solverCells_, sizeof(SolverCell) * kInteriorX * kInteriorY);
         ok = ok && cold((void**)&cellColor_, sizeof(uint16_t) * kInteriorX * kInteriorY);
         if (!ok) {
             Serial.println("Fluid sim alloc failed");
@@ -174,7 +181,7 @@ bool FluidSim::begin(int particleCount, float flipRatio) {
     return true;
 }
 
-void FluidSim::reseed() { seed(seedCount_ > 0 ? seedCount_ : 2400); }
+void FluidSim::reseed() { seed(seedCount_ > 0 ? seedCount_ : 1600); }
 
 void FluidSim::stir() {
     for (int i = 0; i < count_; ++i) {
@@ -377,38 +384,43 @@ void FluidSim::transferToGrid() {
     }
 
     const float h2 = 0.5f * h_;
-    for (int component = 0; component < 2; ++component) {
-        const float dx = component == 0 ? 0.0f : h2;
-        const float dy = component == 0 ? h2 : 0.0f;
-        float* f = component == 0 ? u_ : v_;
-        float* w = component == 0 ? du_ : dv_;
-        const float* vel = component == 0 ? pvx_ : pvy_;
+    const float maxPos = (float)(kNX - 1) * h_;
+    auto scatter = [&](float* f, float* w, const float* vel, float dx, float dy,
+                       TransferStencil* cache) {
         for (int p = 0; p < count_; ++p) {
-            const float x = clampf(px_[p], h_, (float)(kNX - 1) * h_);
-            const float y = clampf(py_[p], h_, (float)(kNY - 1) * h_);
-            int x0 = fastFloor((x - dx) * invH_);
-            int y0 = fastFloor((y - dy) * invH_);
-            x0 = clampi(x0, 0, kNX - 2);
-            y0 = clampi(y0, 0, kNY - 2);
-            const float tx = ((x - dx) - (float)x0 * h_) * invH_;
-            const float ty = ((y - dy) - (float)y0 * h_) * invH_;
-            const int x1 = x0 + 1;
-            const int y1 = y0 + 1;
+            const float x = clampf(px_[p] - dx, h_, maxPos);
+            const float y = clampf(py_[p] - dy, h_, maxPos);
+            int x0 = clampi(fastFloor(x * invH_), 0, kNX - 2);
+            int y0 = clampi(fastFloor(y * invH_), 0, kNY - 2);
+            const float tx = (x - (float)x0 * h_) * invH_;
+            const float ty = (y - (float)y0 * h_) * invH_;
             const float sx = 1.0f - tx;
             const float sy = 1.0f - ty;
-            const float w00 = sx * sy, w10 = tx * sy, w11 = tx * ty, w01 = sx * ty;
+            TransferStencil st;
+            st.base = idx(x0, y0);
+            st.w00 = sx * sy;
+            st.w10 = tx * sy;
+            st.w11 = tx * ty;
+            st.w01 = sx * ty;
+            cache[p] = st;
             const float pv = vel[p];
-            const int n00 = idx(x0, y0), n10 = idx(x1, y0);
-            const int n11 = idx(x1, y1), n01 = idx(x0, y1);
-            f[n00] += pv * w00; w[n00] += w00;
-            f[n10] += pv * w10; w[n10] += w10;
-            f[n11] += pv * w11; w[n11] += w11;
-            f[n01] += pv * w01; w[n01] += w01;
+            const int n00 = st.base;
+            const int n10 = n00 + kNY;
+            const int n11 = n10 + 1;
+            const int n01 = n00 + 1;
+            f[n00] += pv * st.w00; w[n00] += st.w00;
+            f[n10] += pv * st.w10; w[n10] += st.w10;
+            f[n11] += pv * st.w11; w[n11] += st.w11;
+            f[n01] += pv * st.w01; w[n01] += st.w01;
         }
         for (int c = 0; c < kCells; ++c) {
             if (w[c] > 0.0f) f[c] /= w[c];
         }
-    }
+    };
+    // u samples sit on vertical faces (shift y by half a cell);
+    // v samples sit on horizontal faces (shift x by half a cell).
+    scatter(u_, du_, pvx_, 0.0f, h2, stenU_);
+    scatter(v_, dv_, pvy_, h2, 0.0f, stenV_);
     zeroSolidFaces();
 }
 
@@ -442,90 +454,99 @@ void FluidSim::updateDensity() {
     }
 }
 
+void FluidSim::prepareSolverCells() {
+    solverCount_ = 0;
+    const bool hasRest = restDensity_ > 0.0f;
+    for (int i = 1; i < kNX - 1; ++i) {
+        for (int j = 1; j < kNY - 1; ++j) {
+            const int center = idx(i, j);
+            if (cellType_[center] != FLUID) continue;
+            const int left = center - kNY;
+            const int right = center + kNY;
+            const int bottom = center - 1;
+            const int top = center + 1;
+            const float sx0 = (float)solid_[left];
+            const float sx1 = (float)solid_[right];
+            const float sy0 = (float)solid_[bottom];
+            const float sy1 = (float)solid_[top];
+            const float s = sx0 + sx1 + sy0 + sy1;
+            if (s == 0.0f) continue;
+            const float scale = overRelax_ / s;
+            SolverCell& sc = solverCells_[solverCount_++];
+            sc.index = center;
+            sc.fL = sx0 * scale;
+            sc.fR = sx1 * scale;
+            sc.fD = sy0 * scale;
+            sc.fU = sy1 * scale;
+            sc.divOff = 0.0f;
+            if (hasRest) {
+                const float compression = density_[center] - restDensity_;
+                if (compression > 0.0f) sc.divOff = -driftK_ * compression;
+            }
+        }
+    }
+}
+
 void FluidSim::solvePressure(float dt) {
     memcpy(prevU_, u_, sizeof(float) * kCells);
     memcpy(prevV_, v_, sizeof(float) * kCells);
     if (!(dt > 0.0f)) return;
+    prepareSolverCells();
     for (int iter = 0; iter < kPressureIters; ++iter) {
-        for (int i = 1; i < kNX - 1; ++i) {
-            for (int j = 1; j < kNY - 1; ++j) {
-                const int center = idx(i, j);
-                if (cellType_[center] != FLUID) continue;
-                const int left = idx(i - 1, j);
-                const int right = idx(i + 1, j);
-                const int bottom = idx(i, j - 1);
-                const int top = idx(i, j + 1);
-                const float sx0 = (float)solid_[left];
-                const float sx1 = (float)solid_[right];
-                const float sy0 = (float)solid_[bottom];
-                const float sy1 = (float)solid_[top];
-                const float s = sx0 + sx1 + sy0 + sy1;
-                if (s == 0.0f) continue;
-                float div = u_[right] - u_[center] + v_[top] - v_[center];
-                if (restDensity_ > 0.0f) {
-                    const float compression = density_[center] - restDensity_;
-                    if (compression > 0.0f) div -= driftK_ * compression;
-                }
-                float p = -div * kInvOpen[(int)s];
-                p *= overRelax_;
-                u_[center] -= sx0 * p;
-                u_[right] += sx1 * p;
-                v_[center] -= sy0 * p;
-                v_[top] += sy1 * p;
-            }
+        for (int c = 0; c < solverCount_; ++c) {
+            const SolverCell& sc = solverCells_[c];
+            const int center = sc.index;
+            const int right = center + kNY;
+            const int top = center + 1;
+            const float div = u_[right] - u_[center] + v_[top] - v_[center] + sc.divOff;
+            u_[center] += div * sc.fL;
+            u_[right]  -= div * sc.fR;
+            v_[center] += div * sc.fD;
+            v_[top]    -= div * sc.fU;
         }
     }
     zeroSolidFaces();
 }
 
 void FluidSim::transferToParticles() {
-    const float h2 = 0.5f * h_;
+    const float pic = 1.0f - flipRatio_;
     const float flip = flipRatio_;
-    const float pic = 1.0f - flip;
-    for (int component = 0; component < 2; ++component) {
-        const float dx = component == 0 ? 0.0f : h2;
-        const float dy = component == 0 ? h2 : 0.0f;
-        const float* f = component == 0 ? u_ : v_;
-        const float* prev = component == 0 ? prevU_ : prevV_;
-        float* vel = component == 0 ? pvx_ : pvy_;
+    auto sample = [&](const TransferStencil* cache, const float* f, const float* prev,
+                      float* vel, int neighborOff) {
         for (int p = 0; p < count_; ++p) {
-            const float x = clampf(px_[p], h_, (float)(kNX - 1) * h_);
-            const float y = clampf(py_[p], h_, (float)(kNY - 1) * h_);
-            int x0 = clampi(fastFloor((x - dx) * invH_), 0, kNX - 2);
-            int y0 = clampi(fastFloor((y - dy) * invH_), 0, kNY - 2);
-            const float tx = ((x - dx) - (float)x0 * h_) * invH_;
-            const float ty = ((y - dy) - (float)y0 * h_) * invH_;
-            const int x1 = x0 + 1, y1 = y0 + 1;
-            const float sx = 1.0f - tx, sy = 1.0f - ty;
-            const float w00 = sx * sy, w10 = tx * sy, w11 = tx * ty, w01 = sx * ty;
-            const int n00 = idx(x0, y0), n10 = idx(x1, y0);
-            const int n11 = idx(x1, y1), n01 = idx(x0, y1);
-            const bool valid0 = faceHasFluid(x0, y0, component) > 0.0f;
-            const bool valid1 = faceHasFluid(x1, y0, component) > 0.0f;
-            const bool valid2 = faceHasFluid(x1, y1, component) > 0.0f;
-            const bool valid3 = faceHasFluid(x0, y1, component) > 0.0f;
-            const float a0 = valid0 ? w00 : 0.0f;
-            const float a1 = valid1 ? w10 : 0.0f;
-            const float a2 = valid2 ? w11 : 0.0f;
-            const float a3 = valid3 ? w01 : 0.0f;
+            const TransferStencil& st = cache[p];
+            const int n00 = st.base;
+            const int n10 = n00 + kNY;
+            const int n11 = n10 + 1;
+            const int n01 = n00 + 1;
+            auto faceValid = [&](int n) -> float {
+                const int other = n - neighborOff;
+                const bool here = (n >= 0 && n < kCells) && cellType_[n] != 0;
+                const bool mid = (other >= 0 && other < kCells) ? cellType_[other] != 0 : true;
+                return (here || mid) ? 1.0f : 0.0f;
+            };
+            const float a0 = faceValid(n00) * st.w00;
+            const float a1 = faceValid(n10) * st.w10;
+            const float a2 = faceValid(n11) * st.w11;
+            const float a3 = faceValid(n01) * st.w01;
             const float wsum = a0 + a1 + a2 + a3;
             if (!(wsum > 0.0f)) continue;
-            float picV = a0 * f[n00] + a1 * f[n10] + a2 * f[n11] + a3 * f[n01];
-            float corr = a0 * (f[n00] - prev[n00]) + a1 * (f[n10] - prev[n10]) +
-                         a2 * (f[n11] - prev[n11]) + a3 * (f[n01] - prev[n01]);
-            if (!(valid0 && valid1 && valid2 && valid3)) {
-                const float inv = 1.0f / wsum;
-                picV *= inv;
-                corr *= inv;
-            }
-            const float flipV = vel[p] + corr;
-            vel[p] = pic * picV + flip * flipV;
+            const float inv = 1.0f / wsum;
+            const float picV = (a0 * f[n00] + a1 * f[n10] + a2 * f[n11] + a3 * f[n01]) * inv;
+            const float corr = (a0 * (f[n00] - prev[n00]) + a1 * (f[n10] - prev[n10]) +
+                                a2 * (f[n11] - prev[n11]) + a3 * (f[n01] - prev[n01])) * inv;
+            vel[p] = pic * picV + flip * (vel[p] + corr);
         }
-    }
+    };
+    // u faces: neighbour is the cell to the left (one column back).
+    sample(stenU_, u_, prevU_, pvx_, kNY);
+    sample(stenV_, v_, prevV_, pvy_, 1);
     for (int i = 0; i < count_; ++i) clampSpeed(pvx_[i], pvy_[i], kMaxSpeed);
 }
 
-void FluidSim::prepareColors() {
+void FluidSim::prepareColors(uint16_t* dest) {
+    if (!dest) dest = cellColor_;
+    if (!dest) return;
     const float rest = restDensity_ > 0.0f ? restDensity_ : 1.0f;
     const float invRest = 1.0f / rest;
     for (int i = 0; i < kInteriorX; ++i) {
@@ -541,55 +562,82 @@ void FluidSim::prepareColors() {
                 uint8_t val = (uint8_t)clampf(40.0f + d * 200.0f, 20.0f, 255.0f);
                 color = hsvTo565((uint16_t)hue, sat, val);
             }
-            cellColor_[j * kInteriorX + i] = color;
+            dest[j * kInteriorX + i] = color;
         }
     }
 }
 
-void FluidSim::renderBand(uint16_t* dest, int y0, int h, int screenW, bool swapBytes) {
-    const int pixX = 4;
-    const int pixY = 4;
+static inline uint16_t lerp565(uint16_t a, uint16_t b, int t) {
+    // t is 0..255.
+    const int u = 256 - t;
+    const int ra = (a >> 11) & 0x1F, rb = (b >> 11) & 0x1F;
+    const int ga = (a >> 5) & 0x3F,  gb = (b >> 5) & 0x3F;
+    const int ba = a & 0x1F,         bb = b & 0x1F;
+    const int r = (ra * u + rb * t) >> 8;
+    const int g = (ga * u + gb * t) >> 8;
+    const int bl = (ba * u + bb * t) >> 8;
+    return (uint16_t)((r << 11) | (g << 5) | bl);
+}
+
+void FluidSim::renderBand(uint16_t* dest, int y0, int h, int screenW, bool swapBytes,
+                          const uint16_t* colors) {
+    if (!colors) colors = cellColor_;
+    if (!dest || !colors) return;
+    const int gw = kInteriorX;
+    const int gh = kInteriorY;
+    const int BLOCK = 2;
+    const int bw = screenW / BLOCK;
+    const int bh = SCREEN_H / BLOCK;
     const int y1 = y0 + h;
-    for (int y = y0; y < y1; ++y) {
-        const int j = y / pixY;
-        uint16_t* row = dest + (y - y0) * screenW;
-        if ((unsigned)j >= (unsigned)kInteriorY) {
-            memset(row, 0, screenW * 2);
-            continue;
-        }
-        const uint16_t* src = &cellColor_[j * kInteriorX];
-        for (int i = 0; i < kInteriorX; ++i) {
-            uint16_t color = src[i];
-            if (swapBytes) color = (uint16_t)((color << 8) | (color >> 8));
-            const int x0 = i * pixX;
-            row[x0] = color;
-            row[x0 + 1] = color;
-            row[x0 + 2] = color;
-            row[x0 + 3] = color;
-        }
+
+    uint16_t cx0[160];
+    uint8_t cfx[160];
+    const int maxfX = (gw - 1) * 256 - 1;
+    for (int bx = 0; bx < bw && bx < 160; ++bx) {
+        int fx = (int)(((bx + 0.5f) * gw / (float)bw - 0.5f) * 256.0f);
+        if (fx < 0) fx = 0;
+        if (fx > maxfX) fx = maxfX;
+        cx0[bx] = (uint16_t)(fx >> 8);
+        cfx[bx] = (uint8_t)(fx & 255);
     }
 
-    const float scaleX = 4.0f;
-    const float scaleY = 4.0f;
-    for (int p = 0; p < count_; ++p) {
-        const int x = (int)((px_[p] - 1.0f) * scaleX);
-        const int y = (int)((py_[p] - 1.0f) * scaleY);
-        if (y < y0 || y >= y1) continue;
-        if ((unsigned)x >= (unsigned)screenW) continue;
-        const float speed = sqrtf(pvx_[p] * pvx_[p] + pvy_[p] * pvy_[p]);
-        uint8_t add = (uint8_t)clampf(80.0f + speed * 6.0f, 80.0f, 255.0f);
-        uint16_t* pix = &dest[(y - y0) * screenW + x];
-        uint16_t c = *pix;
-        if (swapBytes) c = (uint16_t)((c << 8) | (c >> 8));
-        int r = (c >> 11) & 0x1F;
-        int g = (c >> 5) & 0x3F;
-        int b = c & 0x1F;
-        r = r + ((31 - r) * add) / 400;
-        g = g + ((63 - g) * add) / 400;
-        b = b + ((31 - b) * add) / 400;
-        uint16_t out = (uint16_t)((r << 11) | (g << 5) | b);
-        if (swapBytes) out = (uint16_t)((out << 8) | (out >> 8));
-        *pix = out;
+    const int maxfY = (gh - 1) * 256 - 1;
+    // Bands are multiples of BLOCK, so each 2-row block is computed once
+    // and written to both destination rows (yoRadio 2x2 upsample).
+    int y = y0;
+    if (y & 1) {
+        // odd leftover at the start of a clipped band
+        y = y0;
+    }
+    for (int by = y0 / BLOCK; by * BLOCK < y1; ++by) {
+        const int rowY = by * BLOCK;
+        int fy = (int)(((by + 0.5f) * gh / (float)bh - 0.5f) * 256.0f);
+        if (fy < 0) fy = 0;
+        if (fy > maxfY) fy = maxfY;
+        const uint16_t* r0 = colors + (size_t)(fy >> 8) * gw;
+        const uint16_t* r1 = r0 + gw;
+        const int wy = fy & 255;
+        uint16_t line[160];
+        for (int bx = 0; bx < bw && bx < 160; ++bx) {
+            const int i = cx0[bx];
+            const int wx = cfx[bx];
+            const uint16_t top = lerp565(r0[i], r0[i + 1], wx);
+            const uint16_t bot = lerp565(r1[i], r1[i + 1], wx);
+            uint16_t c = lerp565(top, bot, wy);
+            if (swapBytes) c = (uint16_t)((c << 8) | (c >> 8));
+            line[bx] = c;
+        }
+        for (int dy = 0; dy < BLOCK; ++dy) {
+            const int y = rowY + dy;
+            if (y < y0 || y >= y1) continue;
+            uint16_t* row = dest + (y - y0) * screenW;
+            for (int bx = 0; bx < bw; ++bx) {
+                const uint16_t c = line[bx];
+                const int x0 = bx * BLOCK;
+                row[x0] = c;
+                row[x0 + 1] = c;
+            }
+        }
     }
 }
 

@@ -72,7 +72,7 @@ The enclosure model lives here:
 
 A second PlatformIO environment, `freenove_fnk0104`, targets the Freenove ESP32-S3 Display **FNK0104B** (the “B” variant is the 2.8" **ILI9341** panel with **FT6336** capacitive touch; label example `FNK0104 - B - A1B0`). FNK0104A is the same 2.8" panel without touch. Do not use this env for FNK0104N (3.5" ST77922) or FNK0104S (4.0" ST7789/ST7796).
 
-The Game of Life grid fills the 320×240 landscape screen at **1:1** (one pixel per cell). 2× / 4× render modes zoom a viewport the same way as on the 128×128 OLED. A FLIP/PIC fluid sim (2400 particles on an 80×60 MAC grid) runs as a second mode, driven by an IMU on the touch I2C bus (SDA 16 / SCL 15) or, if no IMU is found, by touch-drag gravity.
+The Game of Life grid fills the 320×240 landscape screen at **1:1** (one pixel per cell). 2× / 4× render modes zoom a viewport the same way as on the 128×128 OLED. A FLIP/PIC fluid sim (1600 particles on a 64×48 MAC grid, solver task on core 0) runs as a second mode, driven by an IMU on the touch I2C bus (SDA 16 / SCL 15) or, if no IMU is found, by touch-drag gravity.
 
 ### Extra controls on this board
 

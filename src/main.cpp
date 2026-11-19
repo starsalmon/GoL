@@ -11,6 +11,8 @@
 #include "imu.h"
 #include "fluid_sim.h"
 #include "wifi_ota.h"
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 TFT_eSPI display = TFT_eSPI();
 #else
 #include <Adafruit_GFX.h>
@@ -451,28 +453,64 @@ void renderToFramebuffer4x() {
 }
 
 #if defined(BOARD_FNK0104)
-// CPU SPI in 16-line internal-RAM bands. DMA + 80 MHz froze the panel
-// again (same class of bug as 43a2453). 60 MHz without DMA is the
-// conservative step up from the known-good 40 MHz path in 189143b.
+// CPU SPI in 40-line internal-RAM bands at 80 MHz. Do not use TFT_eSPI
+// DMA on this panel — it freezes after the first frame (43a2453).
 
-static uint16_t panelGotA = 0, panelGotB = 0;
-static bool panelChanging = false;
-static bool panelMatch = false;
-
-// Two-color readback over MISO (GPIO 13). Called once a second from
-// updateFPS so it does not pad every frame's push time.
-static void verifyPanelUpdated() {
+// One-time MISO readback at boot only (no per-frame debug pixel).
+static void verifyPanelAtBoot() {
     auto okval = [](uint16_t want, uint16_t got) {
         const uint16_t swapped = (uint16_t)((want << 8) | (want >> 8));
         return got == want || got == swapped;
     };
     const uint16_t wantA = 0xF800, wantB = 0x001F;
     display.drawPixel(2, 2, wantA);
-    panelGotA = display.readPixel(2, 2);
+    const uint16_t a = display.readPixel(2, 2);
     display.drawPixel(2, 2, wantB);
-    panelGotB = display.readPixel(2, 2);
-    panelChanging = (panelGotA != panelGotB);
-    panelMatch = okval(wantA, panelGotA) && okval(wantB, panelGotB);
+    const uint16_t b = display.readPixel(2, 2);
+    display.drawPixel(2, 2, TFT_BLACK);
+    const bool ok = (a != b) && okval(wantA, a) && okval(wantB, b);
+    Serial.printf("TFT boot readback: 0x%04X/0x%04X %s\n",
+                  (unsigned)a, (unsigned)b, ok ? "ok" : "MISMATCH");
+}
+
+// Fluid solver task (core 0) publishes a colour field; loop (core 1) blits it.
+static uint16_t *fluidColor[2] = {nullptr, nullptr};
+static volatile int fluidPub = 0;
+static volatile int fluidInUse = -1;
+static volatile uint32_t fluidSeq = 0;
+static volatile uint32_t fluidDrawnSeq = 0;
+static volatile uint32_t fluidAccStepUs = 0, fluidAccSteps = 0;
+static volatile float fluidGx = 0.0f, fluidGy = 1.0f;
+static volatile bool fluidSimRun = false;
+static TaskHandle_t fluidTask = nullptr;
+
+static void fluidSimTask(void *) {
+    int write = 0;
+    while (true) {
+        if (!fluidSimRun || !fluidMode || paused) {
+            vTaskDelay(1);
+            continue;
+        }
+        // Do not overwrite a buffer the display is still pushing.
+        while (fluidInUse == write) vTaskDelay(1);
+        const float gx = fluidGx;
+        const float gy = fluidGy;
+        const uint32_t t0 = micros();
+        fluid.step(gx, gy, 1.0f / 30.0f);
+        fluid.prepareColors(fluidColor[write]);
+        const uint32_t dt = micros() - t0;
+        fluidPub = write;
+        fluidSeq = fluidSeq + 1;
+        write ^= 1;
+        fluidAccStepUs += dt;
+        fluidAccSteps += 1;
+    }
+}
+
+static void startFluidTask() {
+    if (fluidTask) return;
+    fluidSimRun = true;
+    xTaskCreatePinnedToCore(fluidSimTask, "fluidSim", 8192, nullptr, 1, &fluidTask, 0);
 }
 
 static void pushBand(int y, int h, int slot) {
@@ -520,15 +558,13 @@ static void pushGol1to1Bands() {
     endFramePush();
 }
 
-static void pushFluidBands() {
-    fluid.prepareColors();
+static void pushFluidBands(const uint16_t *colors) {
     beginFramePush();
     int slot = 0;
     for (int y = 0; y < SCREEN_H; y += kDmaBand) {
         int h = kDmaBand;
         if (y + h > SCREEN_H) h = SCREEN_H - y;
-        // Pre-swap is off; setSwapBytes(true) makes pushImageDMA swap in-place.
-        fluid.renderBand(dmaBuf[slot], y, h, SCREEN_W, false);
+        fluid.renderBand(dmaBuf[slot], y, h, SCREEN_W, false, colors);
         pushBand(y, h, slot);
         slot ^= 1;
     }
@@ -670,16 +706,20 @@ void updateFPS() {
 #if defined(BOARD_FNK0104)
         uint32_t n = (uint32_t)frameCount;
         if (n == 0) n = 1;
-        verifyPanelUpdated();
-        Serial.printf(
-            "FPS: %d  step=%u us  push=%u us  frames=%lu  panel=%s  read=0x%04X/0x%04X  match=%s\n",
-            frameCount,
-            (unsigned)(accStepUs / n),
-            (unsigned)(accPushUs / n),
-            (unsigned long)frameCount,
-            panelChanging ? "changing" : "STUCK",
-            (unsigned)panelGotA, (unsigned)panelGotB,
-            panelMatch ? "yes" : "no");
+        uint32_t stepUs = accStepUs;
+        uint32_t stepN = n;
+        if (fluidMode && fluidAccSteps) {
+            stepUs = fluidAccStepUs;
+            stepN = fluidAccSteps;
+            fluidAccStepUs = 0;
+            fluidAccSteps = 0;
+        }
+        if (stepN == 0) stepN = 1;
+        Serial.printf("FPS: %d  step=%u us  push=%u us  frames=%lu\n",
+                      frameCount,
+                      (unsigned)(stepUs / stepN),
+                      (unsigned)(accPushUs / n),
+                      (unsigned long)frameCount);
         accStepUs = accRenderUs = accPushUs = accOtherUs = 0;
 #else
         Serial.print("FPS: ");
@@ -1107,13 +1147,17 @@ static bool allocBuffers() {
     dmaBuf[1] = (uint16_t *)heap_caps_malloc(bandBytes, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     if (!dmaBuf[0]) dmaBuf[0] = (uint16_t *)take(bandBytes, true);
     if (!dmaBuf[1]) dmaBuf[1] = (uint16_t *)take(bandBytes, true);
+    const size_t colorBytes = (size_t)FluidSim::kInteriorX * FluidSim::kInteriorY * sizeof(uint16_t);
+    fluidColor[0] = (uint16_t *)take(colorBytes, false);
+    fluidColor[1] = (uint16_t *)take(colorBytes, false);
 
     framebuffer = (uint16_t *)take(SCREEN_W * SCREEN_H * sizeof(uint16_t), false);
     grid = (uint32_t *)take(GRID_BYTES, true);
     nextGrid = (uint32_t *)take(GRID_BYTES, true);
     age = (uint8_t *)take(GRID_W * GRID_H, false);  // PSRAM: leave internal RAM for the fluid sim
     historyBuf = (uint8_t *)take(HISTORY * GRID_BYTES, false);
-    if (!framebuffer || !grid || !nextGrid || !age || !historyBuf || !dmaBuf[0] || !dmaBuf[1]) {
+    if (!framebuffer || !grid || !nextGrid || !age || !historyBuf || !dmaBuf[0] || !dmaBuf[1]
+        || !fluidColor[0] || !fluidColor[1]) {
         Serial.println("Buffer alloc failed");
         return false;
     }
@@ -1185,7 +1229,9 @@ void setup() {
 #if defined(BOARD_FNK0104)
     imu.begin();
     fluid.begin();
+    startFluidTask();
     wifiOtaBegin();
+    verifyPanelAtBoot();
 #endif
 
     clearHistoryFrames();
@@ -1227,24 +1273,34 @@ void loop() {
 
 #if defined(BOARD_FNK0104)
     if (fluidMode) {
-        uint32_t t0 = micros();
-        if (!paused) {
-            float gx = 0.0f, gy = 1.0f;
-            const bool gotImu = imu.read(gx, gy);
-            // Live touch-drag overrides the IMU so you can steer even if the
-            // axis map is wrong. Without an IMU, the last drag (or down) is used.
-            if (fluidSteering || !gotImu) {
-                gx = haveTouchGravity ? touchGravityX : 0.0f;
-                gy = haveTouchGravity ? touchGravityY : 1.0f;
-            }
-            fluid.step(gx, gy, 1.0f / 45.0f);
+        float gx = 0.0f, gy = 1.0f;
+        const bool gotImu = imu.read(gx, gy);
+        // Live touch-drag overrides the IMU so you can steer even if the
+        // axis map is wrong. Without an IMU, the last drag (or down) is used.
+        if (fluidSteering || !gotImu) {
+            gx = haveTouchGravity ? touchGravityX : 0.0f;
+            gy = haveTouchGravity ? touchGravityY : 1.0f;
         }
-        uint32_t t1 = micros();
-        pushFluidBands();
-        uint32_t t3 = micros();
-        accStepUs += (t1 - t0);
-        accRenderUs += 0;
-        accPushUs += (t3 - t1);  // render is overlapped with DMA band waits
+        fluidGx = gx;
+        fluidGy = gy;
+
+        const uint32_t seq = fluidSeq;
+        if (seq == fluidDrawnSeq) {
+            // Solver has not published a new frame yet.
+            updateBattery();
+            float speed = isCharging() ? 0.70f : 0.02f;
+            maybeBreatheLED(speed, 0.10f);
+            vTaskDelay(1);
+            return;
+        }
+        const int pub = fluidPub;
+        fluidDrawnSeq = seq;
+        fluidInUse = pub;
+        const uint32_t t1 = micros();
+        pushFluidBands(fluidColor[pub]);
+        const uint32_t t3 = micros();
+        fluidInUse = -1;
+        accPushUs += (t3 - t1);
         updateFPS();
         updateBattery();
         float speed = isCharging() ? 0.70f : 0.02f;
