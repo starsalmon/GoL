@@ -1,20 +1,24 @@
 #include <Arduino.h>
 #include <SPI.h>
+#include <Adafruit_NeoPixel.h>
+#include "board_config.h"
+
+#if defined(BOARD_FNK0104)
+#include <TFT_eSPI.h>
+#include <Wire.h>
+#include <esp_heap_caps.h>
+TFT_eSPI display = TFT_eSPI();
+#else
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1351.h>
-#include <Adafruit_NeoPixel.h>
+Adafruit_SSD1351 display = Adafruit_SSD1351(SCREEN_W, SCREEN_H, &SPI, OLED_CS, OLED_DC, OLED_RST);
+#endif
 
-#define LDO2_EN   17
-#define OLED_CS   5
-#define OLED_DC   4
-#define OLED_RST  2
+static const int W = GRID_W;
+static const int H = GRID_H;
+static const int GRID_BYTES = (GRID_W * GRID_H + 7) / 8;
 
-Adafruit_SSD1351 display = Adafruit_SSD1351(128, 128, &SPI, OLED_CS, OLED_DC, OLED_RST);
-
-static const int W = 128;
-static const int H = 128;
-
-Adafruit_NeoPixel pixels(1, 18, NEO_GRB + NEO_KHZ800);
+Adafruit_NeoPixel pixels(1, NEOPIXEL_PIN, NEO_GRB + NEO_KHZ800);
 
 // Battery checking
 unsigned long lastBatteryCheck = 0;
@@ -27,19 +31,23 @@ unsigned long lastFPSTime = 0;
 int frameCount = 0;
 
 // Bit-packed grid
-uint8_t grid[(W * H) / 8];
-uint8_t nextGrid[(W * H) / 8];
+uint8_t grid[GRID_BYTES];
+uint8_t nextGrid[GRID_BYTES];
 
-// Framebuffer
-uint16_t framebuffer[W * H];
+// Framebuffer is the physical screen (may be larger than the grid).
+#if defined(BOARD_FNK0104)
+static uint16_t *framebuffer = nullptr;
+#else
+static uint16_t framebuffer[SCREEN_W * SCREEN_H];
+#endif
 
 // End-state detection
 static const int HISTORY = 6;
-uint8_t history[HISTORY][(W * H) / 8];
+uint8_t history[HISTORY][GRID_BYTES];
 int historyIndex = 0;
 
 // Age buffer (for heatmap / neon / fire)
-uint8_t age[W * H];
+uint8_t age[GRID_W * GRID_H];
 
 // Global hue shift
 uint16_t hueShift = 0;
@@ -73,6 +81,10 @@ const char* renderNames[NUM_RENDERS] = {
 };
 
 inline int idx(int x, int y) { return y * W + x; }
+inline int fbIdx(int x, int y) { return y * SCREEN_W + x; }
+
+static inline int wrapX(int x) { return (x % W + W) % W; }
+static inline int wrapY(int y) { return (y % H + H) % H; }
 
 inline bool getCell(uint8_t *buf, int x, int y) {
     int i = idx(x, y);
@@ -104,8 +116,8 @@ int countNeighbors(int x, int y) {
     for (int dy = -1; dy <= 1; dy++) {
         for (int dx = -1; dx <= 1; dx++) {
             if (dx == 0 && dy == 0) continue;
-            int nx = (x + dx + W) % W;
-            int ny = (y + dy + H) % H;
+            int nx = wrapX(x + dx);
+            int ny = wrapY(y + dy);
             if (getCell(grid, nx, ny)) c++;
         }
     }
@@ -218,79 +230,69 @@ static inline uint16_t styleColorAt(int x, int y, uint8_t ageVal) {
     }
 }
 
-// 1x Render
+static void fillCell(int dx, int dy, int size, uint16_t color) {
+    for (int yy = 0; yy < size; yy++) {
+        uint16_t *row = &framebuffer[fbIdx(dx, dy + yy)];
+        for (int xx = 0; xx < size; xx++) {
+            row[xx] = color;
+        }
+    }
+}
+
+// 1x Render: each grid cell is CELL_SIZE x CELL_SIZE pixels and fills the screen.
 void renderToFramebuffer() {
     for (int y = 0; y < H; y++) {
         for (int x = 0; x < W; x++) {
-            bool alive = getCell(grid, x, y);
-            int i = idx(x, y);
-
-            if (!alive) {
-                framebuffer[i] = 0x0000;
-                continue;
-            }
-
-            framebuffer[i] = styleColorAt(x, y, age[i]);
+            const bool alive = getCell(grid, x, y);
+            const uint16_t color = alive ? styleColorAt(x, y, age[idx(x, y)]) : 0x0000;
+            fillCell(x * CELL_SIZE, y * CELL_SIZE, CELL_SIZE, color);
         }
     }
 }
 
-// 2x Render
+// 2x Render: show a (W/2)x(H/2) viewport scaled to fill the screen.
 void renderToFramebuffer2x() {
-    // 2x zoom: show a 64x64 viewport scaled to fill 128x128.
-    for (int sy = 0; sy < 64; sy++) {
-        for (int sx = 0; sx < 64; sx++) {
-            const int gx = (viewX + sx) & 127;
-            const int gy = (viewY + sy) & 127;
+    const int zoom = 2;
+    const int vw = W / zoom;
+    const int vh = H / zoom;
+    const int pix = CELL_SIZE * zoom;
+    for (int sy = 0; sy < vh; sy++) {
+        for (int sx = 0; sx < vw; sx++) {
+            const int gx = wrapX(viewX + sx);
+            const int gy = wrapY(viewY + sy);
             const bool alive = getCell(grid, gx, gy);
-
-            uint16_t color = 0x0000;
-            if (alive) {
-                color = styleColorAt(gx, gy, age[idx(gx, gy)]);
-            }
-
-            const int dx = sx * 2;
-            const int dy = sy * 2;
-            framebuffer[idx(dx,     dy    )] = color;
-            framebuffer[idx(dx + 1, dy    )] = color;
-            framebuffer[idx(dx,     dy + 1)] = color;
-            framebuffer[idx(dx + 1, dy + 1)] = color;
+            const uint16_t color = alive ? styleColorAt(gx, gy, age[idx(gx, gy)]) : 0x0000;
+            fillCell(sx * pix, sy * pix, pix, color);
         }
     }
 }
 
-
-// 4x Render
+// 4x Render: show a (W/4)x(H/4) viewport scaled to fill the screen.
 void renderToFramebuffer4x() {
-    // 4x zoom: show a 32x32 viewport scaled to fill 128x128.
-    for (int sy = 0; sy < 32; sy++) {
-        for (int sx = 0; sx < 32; sx++) {
-            const int gx = (viewX + sx) & 127;
-            const int gy = (viewY + sy) & 127;
+    const int zoom = 4;
+    const int vw = W / zoom;
+    const int vh = H / zoom;
+    const int pix = CELL_SIZE * zoom;
+    for (int sy = 0; sy < vh; sy++) {
+        for (int sx = 0; sx < vw; sx++) {
+            const int gx = wrapX(viewX + sx);
+            const int gy = wrapY(viewY + sy);
             const bool alive = getCell(grid, gx, gy);
-
-            uint16_t color = 0x0000;
-            if (alive) {
-                color = styleColorAt(gx, gy, age[idx(gx, gy)]);
-            }
-
-            const int dx = sx * 4;
-            const int dy = sy * 4;
-            for (int yy = 0; yy < 4; yy++) {
-                for (int xx = 0; xx < 4; xx++) {
-                    framebuffer[idx(dx + xx, dy + yy)] = color;
-                }
-            }
+            const uint16_t color = alive ? styleColorAt(gx, gy, age[idx(gx, gy)]) : 0x0000;
+            fillCell(sx * pix, sy * pix, pix, color);
         }
     }
 }
-
 
 void pushFramebufferDMA() {
+#if defined(BOARD_FNK0104)
+    display.pushImage(0, 0, SCREEN_W, SCREEN_H, framebuffer);
+#else
     display.startWrite();
-    display.setAddrWindow(0, 0, W, H);
-    display.writePixels(framebuffer, W * H);
+    display.setAddrWindow(0, 0, SCREEN_W, SCREEN_H);
+    display.writePixels(framebuffer, SCREEN_W * SCREEN_H);
     display.endWrite();
+#endif
 }
 
 bool gridsEqual(uint8_t *a, uint8_t *b) {
@@ -362,21 +364,24 @@ void updateBattery() {
     if (now - lastBatteryCheck < 10000) return;   // run every 10s
     lastBatteryCheck = now;
 
-    // --- Take multiple ADC samples ---
     const int samples = 16;
-    uint32_t sum = 0;
+    float sumMv = 0;
 
     for (int i = 0; i < samples; i++) {
-        sum += analogRead(10);
+        sumMv += analogReadMilliVolts(BAT_ADC_PIN);
         delay(2);   // tiny delay improves stability
     }
 
-    float rawAvg = sum / (float)samples;
+    float rawAvgMv = sumMv / (float)samples;
 
-    // --- Convert to battery voltage (calibrated factor ≈ 3.95) ---
-    float vbat = (rawAvg / 4095.0f) * 3.3f * 3.95f;
+#if defined(BAT_DIVIDER)
+    float vbat = (rawAvgMv * BAT_DIVIDER) / 1000.0f;
+#elif defined(BAT_SCALE)
+    float vbat = (rawAvgMv / 1000.0f) * BAT_SCALE;
+#else
+    float vbat = rawAvgMv / 1000.0f;
+#endif
 
-    // --- Filter (initialise on first run) ---
     if (!vbatInit) {
         filteredVbat = vbat;
         vbatInit = true;
@@ -384,18 +389,16 @@ void updateBattery() {
         filteredVbat = (filteredVbat * 0.85f) + (vbat * 0.15f);
     }
 
-    // --- Debug ---
-    //Serial.print("RAW AVG: ");
-    //Serial.println(rawAvg);
-    //Serial.print("Battery Voltage: ");
-    //Serial.println(filteredVbat, 3);
-
-    // --- LED update ---
     setBatteryLED(filteredVbat);
 }
 
 bool isCharging() {
-    return digitalRead(33) == HIGH;   // 5V present
+#if defined(CHARGE_SENSE_PIN)
+    return digitalRead(CHARGE_SENSE_PIN) == HIGH;   // 5V present
+#else
+    // FNK0104B has no dedicated 5V-sense GPIO in the official pinout.
+    return false;
+#endif
 }
 
 void updateFPS() {
@@ -427,6 +430,12 @@ static void printControls() {
     Serial.println("  p = pause/resume");
     Serial.println("  w/a/s/d = pan viewport (2x/4x)");
     Serial.println("  h/? = help");
+#if defined(HAS_TOUCH)
+    Serial.println("  Touch: tap = reseed, long-press = pause");
+    Serial.println("         1x swipe L/R = style, U/D = render");
+    Serial.println("         2x/4x swipe = pan");
+    Serial.println("  BOOT: short = next style, long = next render");
+#endif
     Serial.println();
 }
 
@@ -467,19 +476,19 @@ static void handleSerialControls() {
                 break;
             case 'w':
             case 'W':
-                viewY = (viewY - 1) & 127;
+                viewY = wrapY(viewY - 1);
                 break;
             case 's':
             case 'S':
-                viewY = (viewY + 1) & 127;
+                viewY = wrapY(viewY + 1);
                 break;
             case 'a':
             case 'A':
-                viewX = (viewX - 1) & 127;
+                viewX = wrapX(viewX - 1);
                 break;
             case 'd':
             case 'D':
-                viewX = (viewX + 1) & 127;
+                viewX = wrapX(viewX + 1);
                 break;
             case 'h':
             case 'H':
@@ -492,22 +501,220 @@ static void handleSerialControls() {
     }
 }
 
-void setup() {
-    Serial.begin(115200);
+#if defined(HAS_TOUCH)
+static bool touchReady = false;
+
+static bool readTouch(int &x, int &y) {
+    if (!touchReady) return false;
+
+    // Arduino-ESP32 3.x: avoid repeated-start (endTransmission(false)),
+    // which returns ESP_ERR_INVALID_STATE on this I2C driver.
+    Wire.beginTransmission(TOUCH_I2C_ADDR);
+    Wire.write(0x02);
+    if (Wire.endTransmission() != 0) return false;
+
+    uint8_t buf[5];
+    if (Wire.requestFrom((uint8_t)TOUCH_I2C_ADDR, (uint8_t)5) != 5) return false;
+    for (int i = 0; i < 5; i++) buf[i] = Wire.read();
+
+    int n = buf[0] & 0x0F;
+    if (n == 0) return false;
+
+    int rawx = ((buf[1] & 0x0F) << 8) | buf[2];
+    int rawy = ((buf[3] & 0x0F) << 8) | buf[4];
+
+    // Native panel is 240x320. Rotation 1 (landscape 320x240):
+    // x' = y, y' = (native_width - 1) - x
+    x = rawy;
+    y = 239 - rawx;
+    if (x < 0) x = 0;
+    if (y < 0) y = 0;
+    if (x >= SCREEN_W) x = SCREEN_W - 1;
+    if (y >= SCREEN_H) y = SCREEN_H - 1;
+    return true;
+}
+
+static void initTouch() {
+    // Match Freenove's FT6336U::begin(): I2C first, then a 10ms reset
+    // and a 500ms wait for the controller to come out of boot.
+    pinMode(TOUCH_INT, INPUT);
+    Wire.begin(TOUCH_SDA, TOUCH_SCL);
+    Wire.setClock(100000);
+
+    pinMode(TOUCH_RST, OUTPUT);
+    digitalWrite(TOUCH_RST, LOW);
+    delay(10);
+    digitalWrite(TOUCH_RST, HIGH);
+    delay(500);
+
+    Wire.beginTransmission(TOUCH_I2C_ADDR);
+    touchReady = (Wire.endTransmission() == 0);
+    Serial.print("FT6336 at 0x38: ");
+    Serial.println(touchReady ? "ok" : "not found");
+    if (!touchReady) {
+        Serial.print("I2C scan:");
+        for (uint8_t addr = 1; addr < 127; addr++) {
+            Wire.beginTransmission(addr);
+            if (Wire.endTransmission() == 0) {
+                Serial.printf(" 0x%02X", addr);
+            }
+        }
+        Serial.println();
+    } else {
+        Wire.setClock(400000);
+    }
+}
+
+static void handleTouch() {
+    int x, y;
+    bool down = readTouch(x, y);
+    static bool touchDown = false;
+    static int touchStartX = 0, touchStartY = 0;
+    static unsigned long touchStartMs = 0;
+    static bool touchDidGesture = false;
+
+    if (down && !touchDown) {
+        touchDown = true;
+        touchStartX = x;
+        touchStartY = y;
+        touchStartMs = millis();
+        touchDidGesture = false;
+    } else if (down && touchDown) {
+        const int dx = x - touchStartX;
+        const int dy = y - touchStartY;
+        if (!touchDidGesture && (abs(dx) > 30 || abs(dy) > 30)) {
+            if (currentRender == 0) {
+                touchDidGesture = true;
+                if (abs(dx) > abs(dy)) {
+                    if (dx > 0) currentStyle = (currentStyle + 1) % NUM_STYLES;
+                    else        currentStyle = (currentStyle + NUM_STYLES - 1) % NUM_STYLES;
+                    Serial.print("Style: ");
+                    Serial.println(styleNames[currentStyle]);
+                } else {
+                    if (dy > 0) currentRender = (currentRender + 1) % NUM_RENDERS;
+                    else        currentRender = (currentRender + NUM_RENDERS - 1) % NUM_RENDERS;
+                    Serial.print("Render: ");
+                    Serial.println(renderNames[currentRender]);
+                }
+            } else {
+                const int step = (currentRender == 1) ? 4 : 8;
+                if (abs(dx) > abs(dy)) {
+                    viewX = wrapX(viewX + (dx > 0 ? -step : step));
+                } else {
+                    viewY = wrapY(viewY + (dy > 0 ? -step : step));
+                }
+                touchStartX = x;
+                touchStartY = y;
+            }
+        }
+    } else if (!down && touchDown) {
+        if (!touchDidGesture) {
+            if (millis() - touchStartMs >= 400) {
+                paused = !paused;
+                Serial.print("Paused: ");
+                Serial.println(paused ? "yes" : "no");
+            } else {
+                randomizeGrid();
+                clearHistoryFrames();
+                Serial.println("Reseeded grid.");
+            }
+        }
+        touchDown = false;
+    }
+}
+
+static void handleBootButton() {
+    static bool lastUp = true;
+    static unsigned long pressStart = 0;
+    static bool longFired = false;
+    const bool up = digitalRead(BOOT_BTN_PIN);   // HIGH = not pressed
+    const bool pressed = !up;
+
+    if (pressed && lastUp) {
+        pressStart = millis();
+        longFired = false;
+    } else if (pressed && !longFired && (millis() - pressStart >= 500)) {
+        currentRender = (currentRender + 1) % NUM_RENDERS;
+        Serial.print("Render: ");
+        Serial.println(renderNames[currentRender]);
+        longFired = true;
+    } else if (!pressed && !lastUp && !longFired) {
+        currentStyle = (currentStyle + 1) % NUM_STYLES;
+        Serial.print("Style: ");
+        Serial.println(styleNames[currentStyle]);
+    }
+    lastUp = up;
+}
+#endif
+
+static bool allocFramebuffer() {
+#if defined(BOARD_FNK0104)
+    framebuffer = (uint16_t *)heap_caps_malloc(
+        SCREEN_W * SCREEN_H * sizeof(uint16_t),
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!framebuffer) {
+        framebuffer = (uint16_t *)malloc(SCREEN_W * SCREEN_H * sizeof(uint16_t));
+    }
+    if (!framebuffer) {
+        Serial.println("Framebuffer alloc failed");
+        return false;
+    }
+#endif
+    return true;
+}
+
+static void initDisplay() {
+#if defined(BOARD_FNK0104)
+    display.init();
+    display.setRotation(1);          // landscape 320x240
+    display.setSwapBytes(true);
+    display.fillScreen(TFT_BLACK);
+    display.setTextColor(TFT_WHITE, TFT_BLACK);
+    display.setTextDatum(MC_DATUM);
+    display.drawString("Game of Life", SCREEN_W / 2, SCREEN_H / 2, 4);
+#else
     display.begin();
     display.fillScreen(0);
+    display.setTextColor(0xFFFF);
+    display.setTextSize(1);
+    display.setCursor(20, 60);
+    display.print("Game of Life");
+#endif
+}
 
-    pinMode(33, INPUT);   // 5V sense
+void setup() {
+    Serial.begin(115200);
+    delay(200);
 
+    if (!allocFramebuffer()) {
+        while (true) delay(1000);
+    }
+
+    initDisplay();
+
+#if defined(CHARGE_SENSE_PIN)
+    pinMode(CHARGE_SENSE_PIN, INPUT);   // 5V sense
+#endif
+
+#if defined(LDO2_EN)
     pinMode(LDO2_EN, OUTPUT);
     digitalWrite(LDO2_EN, HIGH);   // enable LDO2 (powers OLED)
+#endif
 
     pixels.begin();
     pixels.show();
 
-    pinMode(10, INPUT);                       // vbat
-    analogReadResolution(12);                 // 0–4095
-    analogSetPinAttenuation(10, ADC_11db);    // allow up to ~3.3V input
+    analogReadResolution(12);
+#if !defined(BOARD_FNK0104)
+    // pinMode(INPUT) on an ADC pin can mark it digital on Arduino-ESP32 3.x.
+    pinMode(BAT_ADC_PIN, INPUT);
+    analogSetPinAttenuation(BAT_ADC_PIN, ADC_11db);
+#endif
+
+#if defined(HAS_TOUCH)
+    pinMode(BOOT_BTN_PIN, INPUT_PULLUP);
+    initTouch();
+#endif
 
     clearHistoryFrames();
     memset(age, 0, sizeof(age));
@@ -516,7 +723,13 @@ void setup() {
     randomizeGrid();
     currentStyle = random(0, NUM_STYLES);
     currentRender = random(0, NUM_RENDERS);
-    delay(1000);
+    delay(800);
+    Serial.println("GoL boot");
+#if defined(BOARD_FNK0104)
+    Serial.println("Board: Freenove FNK0104B 2.8in ILI9341");
+    Serial.printf("Grid %dx%d, cell %dpx, screen %dx%d\n",
+                  GRID_W, GRID_H, CELL_SIZE, SCREEN_W, SCREEN_H);
+#endif
     Serial.print("Selected style: ");
     Serial.println(styleNames[currentStyle]);
     Serial.print("Selected render: ");
@@ -526,6 +739,10 @@ void setup() {
 
 void loop() {
     handleSerialControls();
+#if defined(HAS_TOUCH)
+    if (touchReady) handleTouch();
+    handleBootButton();
+#endif
 
     if (!paused) {
         hueShift = (hueShift + 1) % 360;
@@ -563,16 +780,14 @@ void loop() {
         case 0: renderToFramebuffer(); break;
         case 1: renderToFramebuffer2x(); break;
         case 2: renderToFramebuffer4x(); break;
-    }    
+    }
 
     pushFramebufferDMA();
 
     //updateFPS();
-    
+
     updateBattery();
 
     float speed = isCharging() ? 0.70f : 0.02f; // breathing speeds up when charging - higher = faster
     breatheLED(speed, 0.10f);   // 10% brightness cap
-
-
 }
