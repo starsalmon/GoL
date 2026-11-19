@@ -13,6 +13,7 @@
 #include "wifi_ota.h"
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
+#include <freertos/semphr.h>
 TFT_eSPI display = TFT_eSPI();
 #else
 #include <Adafruit_GFX.h>
@@ -74,7 +75,7 @@ int historyIndex = 0;
 
 // Global hue shift
 uint16_t hueShift = 0;
-static bool paused = false;
+static volatile bool paused = false;
 
 // Zoom viewport origin for 2x/4x modes (wraps around the toroidal grid).
 static int viewX = 0;
@@ -112,7 +113,7 @@ const char* renderNames[NUM_RENDERS] = {
 #if defined(BOARD_FNK0104)
 static Imu imu;
 static FluidSim fluid;
-static bool fluidMode = false;
+static volatile bool fluidMode = false;
 static float touchGravityX = 0.0f;
 static float touchGravityY = 1.0f;
 static bool haveTouchGravity = false;
@@ -473,9 +474,13 @@ static void verifyPanelAtBoot() {
                   (unsigned)a, (unsigned)b, ok ? "ok" : "MISMATCH");
 }
 
-// Fluid solver task (core 0) publishes a colour field; loop (core 1) blits it.
+// Fluid solver (core 0) writes only the back colour snapshot. It swaps
+// front/back under a mutex; the renderer (core 1) claims the front under
+// the same mutex and is the only reader of that buffer until it releases.
 static uint16_t *fluidColor[2] = {nullptr, nullptr};
-static volatile int fluidPub = 0;
+static SemaphoreHandle_t fluidLock = nullptr;
+static volatile int fluidFront = 0;
+static volatile int fluidBack = 1;
 static volatile int fluidInUse = -1;
 static volatile uint32_t fluidSeq = 0;
 static volatile uint32_t fluidDrawnSeq = 0;
@@ -485,23 +490,48 @@ static volatile bool fluidSimRun = false;
 static TaskHandle_t fluidTask = nullptr;
 
 static void fluidSimTask(void *) {
-    int write = 0;
     while (true) {
         if (!fluidSimRun || !fluidMode || paused) {
             vTaskDelay(1);
             continue;
         }
-        // Do not overwrite a buffer the display is still pushing.
-        while (fluidInUse == write) vTaskDelay(1);
+
+        // Wait until the back buffer is not the one being displayed.
+        for (;;) {
+            xSemaphoreTake(fluidLock, portMAX_DELAY);
+            const int back = fluidBack;
+            const int inUse = fluidInUse;
+            xSemaphoreGive(fluidLock);
+            if (inUse != back) break;
+            vTaskDelay(1);
+        }
+
+        xSemaphoreTake(fluidLock, portMAX_DELAY);
+        const int back = fluidBack;
+        xSemaphoreGive(fluidLock);
+
         const float gx = fluidGx;
         const float gy = fluidGy;
         const uint32_t t0 = micros();
         fluid.step(gx, gy, 1.0f / 30.0f);
-        fluid.prepareColors(fluidColor[write]);
+        fluid.prepareColors(fluidColor[back]);
         const uint32_t dt = micros() - t0;
-        fluidPub = write;
-        fluidSeq = fluidSeq + 1;
-        write ^= 1;
+
+        // Publish: swap only when the current front is no longer in use,
+        // so the renderer never shares a buffer the solver will write next.
+        for (;;) {
+            xSemaphoreTake(fluidLock, portMAX_DELAY);
+            if (fluidInUse == fluidFront) {
+                xSemaphoreGive(fluidLock);
+                vTaskDelay(1);
+                continue;
+            }
+            fluidFront = back;
+            fluidBack = 1 - back;
+            fluidSeq = fluidSeq + 1;
+            xSemaphoreGive(fluidLock);
+            break;
+        }
         fluidAccStepUs += dt;
         fluidAccSteps += 1;
     }
@@ -509,6 +539,11 @@ static void fluidSimTask(void *) {
 
 static void startFluidTask() {
     if (fluidTask) return;
+    if (!fluidLock) fluidLock = xSemaphoreCreateMutex();
+    if (!fluidLock) {
+        Serial.println("Fluid mutex alloc failed");
+        return;
+    }
     fluidSimRun = true;
     xTaskCreatePinnedToCore(fluidSimTask, "fluidSim", 8192, nullptr, 1, &fluidTask, 0);
 }
@@ -1177,7 +1212,8 @@ static void initDisplay() {
     display.init();
     display.setRotation(1);          // landscape 320x240
     display.setSwapBytes(true);
-    Serial.printf("TFT: SPI 80 MHz, CPU pushImage in %d-line bands (no DMA)\n", kDmaBand);
+    Serial.printf("TFT: SPI %u MHz, CPU pushImage in %d-line bands (no DMA)\n",
+                  (unsigned)(SPI_FREQUENCY / 1000000), kDmaBand);
     display.fillScreen(TFT_BLACK);
     display.setTextColor(TFT_WHITE, TFT_BLACK);
     display.setTextDatum(MC_DATUM);
@@ -1284,8 +1320,11 @@ void loop() {
         fluidGx = gx;
         fluidGy = gy;
 
+        xSemaphoreTake(fluidLock, portMAX_DELAY);
         const uint32_t seq = fluidSeq;
+        const int front = fluidFront;
         if (seq == fluidDrawnSeq) {
+            xSemaphoreGive(fluidLock);
             // Solver has not published a new frame yet.
             updateBattery();
             float speed = isCharging() ? 0.70f : 0.02f;
@@ -1293,13 +1332,17 @@ void loop() {
             vTaskDelay(1);
             return;
         }
-        const int pub = fluidPub;
         fluidDrawnSeq = seq;
-        fluidInUse = pub;
+        fluidInUse = front;
+        xSemaphoreGive(fluidLock);
+
         const uint32_t t1 = micros();
-        pushFluidBands(fluidColor[pub]);
+        pushFluidBands(fluidColor[front]);
         const uint32_t t3 = micros();
-        fluidInUse = -1;
+
+        xSemaphoreTake(fluidLock, portMAX_DELAY);
+        if (fluidInUse == front) fluidInUse = -1;
+        xSemaphoreGive(fluidLock);
         accPushUs += (t3 - t1);
         updateFPS();
         updateBattery();

@@ -94,10 +94,11 @@ float clampf(float v, float lo, float hi) {
 }
 
 // axis: 0=X 1=Y 2=Z, sign ±1. Twelve common board orientations.
+// Map 0 is the default: screenX=+X, screenY=-Y (flipped Y; "flip y").
 const int kMaps[][4] = {
-    {0, 1,  1,  1},
-    {0, 1, -1,  1},
     {0, 1,  1, -1},
+    {0, 1, -1,  1},
+    {0, 1,  1,  1},
     {0, 1, -1, -1},
     {1, 0,  1,  1},
     {1, 0, -1,  1},
