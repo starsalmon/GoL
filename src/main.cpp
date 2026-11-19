@@ -44,6 +44,10 @@ unsigned long lastFPSTime = 0;
 int frameCount = 0;
 #if defined(BOARD_FNK0104)
 static uint32_t accStepUs = 0, accRenderUs = 0, accPushUs = 0, accOtherUs = 0;
+static uint32_t accDirtyUnits = 0, accDirtyTotal = 0;
+static bool golPrevValid = false;
+static bool fluidPrevValid = false;
+static uint16_t *fluidPrev = nullptr;  // 64x48 previous colour field
 #endif
 
 // Bit-packed grid. On the Freenove these live in PSRAM / internal heap.
@@ -161,6 +165,9 @@ inline void setCell(uint8_t *buf, int x, int y, bool v) {
 #endif
 
 void randomizeGrid() {
+#if defined(BOARD_FNK0104)
+    golPrevValid = false;
+#endif
     memset(grid, 0, GRID_BYTES);
     memset(nextGrid, 0, GRID_BYTES);
     memset(age, 0, GRID_W * GRID_H);
@@ -454,7 +461,7 @@ void renderToFramebuffer4x() {
 }
 
 #if defined(BOARD_FNK0104)
-// CPU SPI in 40-line internal-RAM bands at 80 MHz. Do not use TFT_eSPI
+// CPU SPI in 40-line internal-RAM bands. Do not use TFT_eSPI
 // DMA on this panel — it freezes after the first frame (43a2453).
 
 // One-time MISO readback at boot only (no per-frame debug pixel).
@@ -514,7 +521,7 @@ static void fluidSimTask(void *) {
         const float gy = fluidGy;
         const uint32_t t0 = micros();
         fluid.step(gx, gy, 1.0f / 30.0f);
-        fluid.prepareView(fluidColor[back], FluidSim::kViewW, FluidSim::kViewH);
+        fluid.prepareColors(fluidColor[back]);
         const uint32_t dt = micros() - t0;
 
         // Publish: swap only when the current front is no longer in use,
@@ -551,13 +558,29 @@ static void startFluidTask() {
     xTaskCreatePinnedToCore(fluidSimTask, "fluidSim", 8192, nullptr, 1, &fluidTask, 0);
 }
 
-static void pushBand(int y, int h, int slot) {
-    display.pushImage(0, y, SCREEN_W, h, dmaBuf[slot]);
+static void markGolDirty() { golPrevValid = false; }
+static void markFluidDirty() { fluidPrevValid = false; }
+
+static inline uint16_t swap565(uint16_t c) {
+    return (uint16_t)((c << 8) | (c >> 8));
 }
 
-static void beginFramePush() {}
+// One startWrite for the whole frame. Colours in data are already byte-swapped
+// so pushPixels can use the fast native path (setSwapBytes false).
+static void tftBeginBurst() {
+    display.startWrite();
+    display.setSwapBytes(false);
+}
 
-static void endFramePush() {}
+static void tftEndBurst() {
+    display.endWrite();
+    display.setSwapBytes(true);
+}
+
+static void tftPushPreSwapped(int x, int y, int w, int h, uint16_t *data) {
+    display.setAddrWindow(x, y, w, h);
+    display.pushPixels(data, (uint32_t)w * (uint32_t)h);
+}
 
 static void renderGolBand(uint16_t *dest, int y0, int h) {
     for (int y = 0; y < h; y++) {
@@ -571,58 +594,113 @@ static void renderGolBand(uint16_t *dest, int y0, int h) {
 }
 
 static void pushFramebufferBands() {
-    beginFramePush();
-    int slot = 0;
+    display.setSwapBytes(true);
     for (int y = 0; y < SCREEN_H; y += kDmaBand) {
         int h = kDmaBand;
         if (y + h > SCREEN_H) h = SCREEN_H - y;
-        memcpy(dmaBuf[slot], framebuffer + y * SCREEN_W, (size_t)h * SCREEN_W * 2);
-        pushBand(y, h, slot);
-        slot ^= 1;
+        memcpy(dmaBuf[0], framebuffer + y * SCREEN_W, (size_t)h * SCREEN_W * 2);
+        display.pushImage(0, y, SCREEN_W, h, dmaBuf[0]);
     }
-    endFramePush();
 }
 
+// 1:1 GoL: diff final colours against the last pushed frame and send only
+// dirty row-spans (min/max x), packed into dmaBuf. Age and hue styles are
+// handled correctly because we compare the rendered pixels, not just cells.
 static void pushGol1to1Bands() {
-    beginFramePush();
-    int slot = 0;
-    for (int y = 0; y < SCREEN_H; y += kDmaBand) {
-        int h = kDmaBand;
-        if (y + h > SCREEN_H) h = SCREEN_H - y;
-        renderGolBand(dmaBuf[slot], y, h);
-        pushBand(y, h, slot);
-        slot ^= 1;
-    }
-    endFramePush();
-}
+    uint16_t line[SCREEN_W];
+    int16_t xmin[SCREEN_H], xmax[SCREEN_H];
+    uint16_t *prev = framebuffer;
 
-static void pushFluidBands(const uint16_t *view) {
-    // view is 160x120. Expand 2x into a fully written 40-line band, then
-    // pushImage. No DMA. Every pixel in the band is written before the push
-    // so stale buffer contents cannot show as black blocks.
-    const int vw = FluidSim::kViewW;
-    const int vh = FluidSim::kViewH;
-    const int xScale = SCREEN_W / vw;   // 2
-    const int yScale = SCREEN_H / vh;   // 2
-    for (int y = 0; y < SCREEN_H; y += kDmaBand) {
-        int h = kDmaBand;
-        if (y + h > SCREEN_H) h = SCREEN_H - y;
-        uint16_t *dest = dmaBuf[0];
-        memset(dest, 0, (size_t)h * SCREEN_W * sizeof(uint16_t));
-        for (int row = 0; row < h; ++row) {
-            const int sy = (y + row) / yScale;
-            if ((unsigned)sy >= (unsigned)vh) continue;
-            const uint16_t *src = view + sy * vw;
-            uint16_t *out = dest + row * SCREEN_W;
-            for (int sx = 0; sx < vw; ++sx) {
-                const uint16_t c = src[sx];
-                const int x0 = sx * xScale;
-                out[x0] = c;
-                if (xScale > 1) out[x0 + 1] = c;
+    for (int y = 0; y < SCREEN_H; ++y) {
+        const uint8_t *ageRow = age + y * W;
+        uint16_t *old = prev + y * SCREEN_W;
+        int x0 = SCREEN_W, x1 = -1;
+        for (int x = 0; x < W; ++x) {
+            const uint16_t c = getCell(grid, x, y) ? styleColorAt(x, y, ageRow[x]) : 0x0000;
+            line[x] = c;
+            if (!golPrevValid || old[x] != c) {
+                if (x < x0) x0 = x;
+                if (x > x1) x1 = x;
             }
         }
-        display.pushImage(0, y, SCREEN_W, h, dest);
+        memcpy(old, line, SCREEN_W * sizeof(uint16_t));
+        xmin[y] = (int16_t)x0;
+        xmax[y] = (int16_t)x1;
     }
+    golPrevValid = true;
+
+    tftBeginBurst();
+    int y = 0;
+    uint32_t pushed = 0;
+    while (y < SCREEN_H) {
+        if (xmax[y] < 0) {
+            ++y;
+            continue;
+        }
+        int y0 = y;
+        int x0 = xmin[y];
+        int x1 = xmax[y];
+        ++y;
+        while (y < SCREEN_H && xmax[y] >= 0 && (y - y0) < kDmaBand) {
+            if (xmin[y] < x0) x0 = xmin[y];
+            if (xmax[y] > x1) x1 = xmax[y];
+            ++y;
+        }
+        const int h = y - y0;
+        const int w = x1 - x0 + 1;
+        uint16_t *dst = dmaBuf[0];
+        for (int r = 0; r < h; ++r) {
+            const uint16_t *src = prev + (y0 + r) * SCREEN_W + x0;
+            uint16_t *out = dst + r * w;
+            for (int i = 0; i < w; ++i) out[i] = swap565(src[i]);
+        }
+        tftPushPreSwapped(x0, y0, w, h, dst);
+        pushed += (uint32_t)h;
+    }
+    tftEndBurst();
+    accDirtyUnits += pushed;
+    accDirtyTotal += (uint32_t)SCREEN_H;
+}
+
+// Fluid: core 0 publishes a 64x48 colour field. Core 1 bilinear-upscales
+// and pushes only the 40-line bands whose source cells changed (empty air
+// above the pool is skipped). Each pushed band is fully written.
+static void pushFluidBands(const uint16_t *view) {
+    const int gw = FluidSim::kInteriorX;
+    const int gh = FluidSim::kInteriorY;
+    tftBeginBurst();
+    uint32_t pushed = 0;
+    for (int y = 0; y < SCREEN_H; y += kDmaBand) {
+        int h = kDmaBand;
+        if (y + h > SCREEN_H) h = SCREEN_H - y;
+        // Bilinear samples neighbouring cell rows; include a 1-row margin.
+        int j0 = y / 5 - 1;
+        int j1 = (y + h - 1) / 5 + 1;
+        if (j0 < 0) j0 = 0;
+        if (j1 >= gh) j1 = gh - 1;
+        bool dirty = !fluidPrevValid || !fluidPrev;
+        if (!dirty) {
+            for (int j = j0; j <= j1; ++j) {
+                if (memcmp(view + j * gw, fluidPrev + j * gw, (size_t)gw * 2) != 0) {
+                    dirty = true;
+                    break;
+                }
+            }
+        }
+        if (!dirty) continue;
+        uint16_t *dest = dmaBuf[0];
+        memset(dest, 0, (size_t)h * SCREEN_W * sizeof(uint16_t));
+        fluid.renderBand(dest, y, h, SCREEN_W, false, view);
+        const int n = h * SCREEN_W;
+        for (int i = 0; i < n; ++i) dest[i] = swap565(dest[i]);
+        tftPushPreSwapped(0, y, SCREEN_W, h, dest);
+        pushed += (uint32_t)h;
+    }
+    if (fluidPrev) memcpy(fluidPrev, view, (size_t)gw * gh * 2);
+    fluidPrevValid = true;
+    tftEndBurst();
+    accDirtyUnits += pushed;
+    accDirtyTotal += (uint32_t)SCREEN_H;
 }
 #endif
 
@@ -769,12 +847,15 @@ void updateFPS() {
             fluidAccSteps = 0;
         }
         if (stepN == 0) stepN = 1;
-        Serial.printf("FPS: %d  step=%u us  push=%u us  frames=%lu\n",
+        Serial.printf("FPS: %d  step=%u us  push=%u us  dirty=%u/%u  frames=%lu\n",
                       frameCount,
                       (unsigned)(stepUs / stepN),
                       (unsigned)(accPushUs / n),
+                      (unsigned)(accDirtyTotal ? accDirtyUnits : 0),
+                      (unsigned)(accDirtyTotal ? accDirtyTotal : 1),
                       (unsigned long)frameCount);
         accStepUs = accRenderUs = accPushUs = accOtherUs = 0;
+        accDirtyUnits = accDirtyTotal = 0;
 #else
         Serial.print("FPS: ");
         Serial.println(frameCount);
@@ -794,6 +875,8 @@ static void clearHistoryFrames() {
 #if defined(BOARD_FNK0104)
 static void toggleFluidMode() {
     fluidMode = !fluidMode;
+    markGolDirty();
+    markFluidDirty();
     if (fluidMode) {
         if (!fluid.ready()) fluid.begin();
         else fluid.reseed();
@@ -854,12 +937,18 @@ static void handleSerialControls() {
             case 'r':
             case 'R':
                 currentRender = (currentRender + 1) % NUM_RENDERS;
+#if defined(BOARD_FNK0104)
+                markGolDirty();
+#endif
                 Serial.print("Render: ");
                 Serial.println(renderNames[currentRender]);
                 break;
             case 'e':
             case 'E':
                 currentStyle = (currentStyle + 1) % NUM_STYLES;
+#if defined(BOARD_FNK0104)
+                markGolDirty();
+#endif
                 Serial.print("Style: ");
                 Serial.println(styleNames[currentStyle]);
                 break;
@@ -868,6 +957,7 @@ static void handleSerialControls() {
 #if defined(BOARD_FNK0104)
                 if (fluidMode) {
                     fluid.reseed();
+                    markFluidDirty();
                     Serial.println("Reseeded fluid.");
                     break;
                 }
@@ -1063,11 +1153,13 @@ static void handleTouch() {
                 if (abs(dx) > abs(dy)) {
                     if (dx > 0) currentStyle = (currentStyle + 1) % NUM_STYLES;
                     else        currentStyle = (currentStyle + NUM_STYLES - 1) % NUM_STYLES;
+                    markGolDirty();
                     Serial.print("Style: ");
                     Serial.println(styleNames[currentStyle]);
                 } else {
                     if (dy > 0) currentRender = (currentRender + 1) % NUM_RENDERS;
                     else        currentRender = (currentRender + NUM_RENDERS - 1) % NUM_RENDERS;
+                    markGolDirty();
                     Serial.print("Render: ");
                     Serial.println(renderNames[currentRender]);
                 }
@@ -1157,6 +1249,7 @@ static void handleBootButton() {
 #endif
         {
             currentRender = (currentRender + 1) % NUM_RENDERS;
+            markGolDirty();
             Serial.print("Render: ");
             Serial.println(renderNames[currentRender]);
         }
@@ -1184,6 +1277,7 @@ static void handleBootButton() {
 #endif
         {
             currentStyle = (currentStyle + 1) % NUM_STYLES;
+            markGolDirty();
             Serial.print("Style: ");
             Serial.println(styleNames[currentStyle]);
         }
@@ -1210,9 +1304,10 @@ static bool allocBuffers() {
     dmaBuf[1] = (uint16_t *)heap_caps_malloc(bandBytes, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     if (!dmaBuf[0]) dmaBuf[0] = (uint16_t *)take(bandBytes, true);
     if (!dmaBuf[1]) dmaBuf[1] = (uint16_t *)take(bandBytes, true);
-    const size_t colorBytes = (size_t)FluidSim::kViewW * FluidSim::kViewH * sizeof(uint16_t);
+    const size_t colorBytes = (size_t)FluidSim::kInteriorX * FluidSim::kInteriorY * sizeof(uint16_t);
     fluidColor[0] = (uint16_t *)take(colorBytes, false);
     fluidColor[1] = (uint16_t *)take(colorBytes, false);
+    fluidPrev = (uint16_t *)take(colorBytes, false);
 
     framebuffer = (uint16_t *)take(SCREEN_W * SCREEN_H * sizeof(uint16_t), false);
     grid = (uint32_t *)take(GRID_BYTES, true);
@@ -1220,7 +1315,7 @@ static bool allocBuffers() {
     age = (uint8_t *)take(GRID_W * GRID_H, false);  // PSRAM: leave internal RAM for the fluid sim
     historyBuf = (uint8_t *)take(HISTORY * GRID_BYTES, false);
     if (!framebuffer || !grid || !nextGrid || !age || !historyBuf || !dmaBuf[0] || !dmaBuf[1]
-        || !fluidColor[0] || !fluidColor[1]) {
+        || !fluidColor[0] || !fluidColor[1] || !fluidPrev) {
         Serial.println("Buffer alloc failed");
         return false;
     }
@@ -1235,13 +1330,26 @@ static bool allocBuffers() {
     return true;
 }
 
+// ESP32-S3 HSPI (SPI3) clock actually programmed after display.init().
+// freq = APB / ((clkdiv_pre+1) * (clkcnt_n+1)), or APB if clk_equ_sysclk.
+static uint32_t actualSpiWriteHz() {
+    const uint32_t apb = getApbFrequency();
+    const uint32_t reg = *(volatile uint32_t *)SPI_CLOCK_REG(SPI_PORT);
+    if (reg & (1u << 31)) return apb;  // clk_equ_sysclk
+    const uint32_t clkcnt_n = (reg >> 12) & 0x3Fu;
+    const uint32_t clkdiv_pre = (reg >> 18) & 0xFu;
+    return apb / ((clkdiv_pre + 1u) * (clkcnt_n + 1u));
+}
+
 static void initDisplay() {
 #if defined(BOARD_FNK0104)
     display.init();
     display.setRotation(1);          // landscape 320x240
     display.setSwapBytes(true);
-    Serial.printf("TFT: SPI %u MHz, CPU pushImage in %d-line bands (no DMA)\n",
-                  (unsigned)(SPI_FREQUENCY / 1000000), kDmaBand);
+    Serial.printf("TFT: SPI request %u MHz, actual %u MHz, CPU bands %d (no DMA)\n",
+                  (unsigned)(SPI_FREQUENCY / 1000000),
+                  (unsigned)((actualSpiWriteHz() + 500000) / 1000000),
+                  kDmaBand);
     display.fillScreen(TFT_BLACK);
     display.setTextColor(TFT_WHITE, TFT_BLACK);
     display.setTextDatum(MC_DATUM);
@@ -1324,6 +1432,9 @@ void setup() {
     Serial.println("GoL boot");
 #if defined(BOARD_FNK0104)
     Serial.println("Board: Freenove FNK0104B 2.8in ILI9341");
+    Serial.printf("SPI write request %u MHz, actual %u MHz, dirty-region blit, no DMA\n",
+                  (unsigned)(SPI_FREQUENCY / 1000000),
+                  (unsigned)((actualSpiWriteHz() + 500000) / 1000000));
     Serial.printf("Grid %dx%d, cell %dpx, screen %dx%d\n",
                   GRID_W, GRID_H, CELL_SIZE, SCREEN_W, SCREEN_H);
 #endif
@@ -1409,7 +1520,9 @@ void loop() {
             randomizeGrid();
             clearHistoryFrames();
             currentStyle = random(0, NUM_STYLES);
-#if !defined(BOARD_FNK0104)
+#if defined(BOARD_FNK0104)
+            markGolDirty();
+#else
             currentRender = random(0, NUM_RENDERS);
 #endif
 
