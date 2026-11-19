@@ -101,7 +101,6 @@ const char* renderNames[NUM_RENDERS] = {
 static Imu imu;
 static FluidSim fluid;
 static bool fluidMode = false;
-static bool dmaReady = false;
 static float touchGravityX = 0.0f;
 static float touchGravityY = 1.0f;
 static bool haveTouchGravity = false;
@@ -294,12 +293,6 @@ static void fillCell(int dx, int dy, int size, uint16_t color) {
     }
 }
 
-static void waitForDma() {
-#if defined(BOARD_FNK0104)
-    if (dmaReady) display.dmaWait();
-#endif
-}
-
 // 1x / 1:1 Render: each grid cell is CELL_SIZE x CELL_SIZE pixels and fills the screen.
 void renderToFramebuffer() {
 #if defined(BOARD_FNK0104)
@@ -359,12 +352,16 @@ void renderToFramebuffer4x() {
 
 void pushFramebufferDMA() {
 #if defined(BOARD_FNK0104)
-    if (dmaReady) {
-        display.startWrite();
-        display.pushImageDMA(0, 0, SCREEN_W, SCREEN_H, framebuffer);
-        display.endWrite();
-    } else {
-        display.pushImage(0, 0, SCREEN_W, SCREEN_H, framebuffer);
+    // Do not use pushImageDMA on the PSRAM framebuffer. initDMA() succeeds
+    // on the S3, but startWrite + pushImageDMA + endWrite raises CS before
+    // the transfer finishes, so the panel keeps the first frame while the
+    // loop still runs (FPS printed, serial/touch still handled).
+    // CPU SPI in 16-line bands is the same path that worked on 57f6df5.
+    const int kBand = 16;
+    for (int y = 0; y < SCREEN_H; y += kBand) {
+        int h = kBand;
+        if (y + h > SCREEN_H) h = SCREEN_H - y;
+        display.pushImage(0, y, SCREEN_W, h, framebuffer + (y * SCREEN_W));
     }
 #else
     display.startWrite();
@@ -939,8 +936,7 @@ static void initDisplay() {
     display.init();
     display.setRotation(1);          // landscape 320x240
     display.setSwapBytes(true);
-    dmaReady = display.initDMA();
-    Serial.printf("TFT DMA: %s\n", dmaReady ? "on" : "off, using pushImage");
+    Serial.println("TFT: CPU pushImage in 16-line bands (no DMA)");
     display.fillScreen(TFT_BLACK);
     display.setTextColor(TFT_WHITE, TFT_BLACK);
     display.setTextDatum(MC_DATUM);
@@ -1045,7 +1041,6 @@ void loop() {
             }
             fluid.step(gx, gy, 1.0f / 45.0f);
         }
-        waitForDma();
         fluid.render(framebuffer, SCREEN_W, SCREEN_H);
         pushFramebufferDMA();
         updateFPS();
@@ -1090,7 +1085,6 @@ void loop() {
         historyIndex = (historyIndex + 1) % HISTORY;
     }
 
-    waitForDma();
     switch (currentRender) {
         case 0: renderToFramebuffer(); break;
         case 1: renderToFramebuffer2x(); break;
