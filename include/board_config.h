@@ -10,9 +10,9 @@
 
 #define SCREEN_W        320
 #define SCREEN_H        240
-#define GRID_W          160
-#define GRID_H          120
-#define CELL_SIZE       2
+#define GRID_W          320
+#define GRID_H          240
+#define CELL_SIZE       1
 
 #define NEOPIXEL_PIN    42          // official FNK0104A/B WS2812 pin (N/S use 40)
 #define BAT_ADC_PIN     9           // official 2:1 divider on the 2.8" board
@@ -25,6 +25,9 @@
 #define TOUCH_INT       17
 #define TOUCH_RST       18
 #define TOUCH_I2C_ADDR  0x38
+
+#define OTA_HOSTNAME    "gol-freenove"
+#define OTA_PORT        3232
 
 #else
 // Unexpected Maker ProS3 + SSD1351 128x128 OLED

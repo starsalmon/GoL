@@ -1,12 +1,16 @@
 #include <Arduino.h>
 #include <SPI.h>
 #include <Adafruit_NeoPixel.h>
+#include <string.h>
 #include "board_config.h"
 
 #if defined(BOARD_FNK0104)
 #include <TFT_eSPI.h>
 #include <Wire.h>
 #include <esp_heap_caps.h>
+#include "imu.h"
+#include "fluid_sim.h"
+#include "wifi_ota.h"
 TFT_eSPI display = TFT_eSPI();
 #else
 #include <Adafruit_GFX.h>
@@ -30,9 +34,20 @@ uint8_t ledR = 0, ledG = 255, ledB = 0;   // default green
 unsigned long lastFPSTime = 0;
 int frameCount = 0;
 
-// Bit-packed grid
+// Bit-packed grid. On the Freenove these live in PSRAM / internal heap.
+#if defined(BOARD_FNK0104)
+static uint8_t *grid = nullptr;
+static uint8_t *nextGrid = nullptr;
+static uint8_t *age = nullptr;
+static uint8_t *historyBuf = nullptr;
+static inline uint8_t *historyFrame(int i) { return historyBuf + i * GRID_BYTES; }
+#else
 uint8_t grid[GRID_BYTES];
 uint8_t nextGrid[GRID_BYTES];
+uint8_t age[GRID_W * GRID_H];
+uint8_t history[6][GRID_BYTES];
+static inline uint8_t *historyFrame(int i) { return history[i]; }
+#endif
 
 // Framebuffer is the physical screen (may be larger than the grid).
 #if defined(BOARD_FNK0104)
@@ -43,11 +58,7 @@ static uint16_t framebuffer[SCREEN_W * SCREEN_H];
 
 // End-state detection
 static const int HISTORY = 6;
-uint8_t history[HISTORY][GRID_BYTES];
 int historyIndex = 0;
-
-// Age buffer (for heatmap / neon / fire)
-uint8_t age[GRID_W * GRID_H];
 
 // Global hue shift
 uint16_t hueShift = 0;
@@ -70,21 +81,46 @@ const char* styleNames[NUM_STYLES] = {
     "Fire"
 };
 
-// Renders
+// Renders. On the Freenove, 1:1 is a 320x240 grid (one pixel per cell).
 int currentRender = 0;
 const int NUM_RENDERS = 3;
 
 const char* renderNames[NUM_RENDERS] = {
+#if defined(BOARD_FNK0104)
+    "1:1 Render",
+    "2x Zoom",
+    "4x Zoom"
+#else
     "1x Render",
     "2x Render",
     "4x Render"
+#endif
 };
+
+#if defined(BOARD_FNK0104)
+static Imu imu;
+static FluidSim fluid;
+static bool fluidMode = false;
+static bool dmaReady = false;
+static float touchGravityX = 0.0f;
+static float touchGravityY = 1.0f;
+static bool haveTouchGravity = false;
+static bool fluidSteering = false;  // true while a finger is dragging in fluid mode
+#endif
 
 inline int idx(int x, int y) { return y * W + x; }
 inline int fbIdx(int x, int y) { return y * SCREEN_W + x; }
 
-static inline int wrapX(int x) { return (x % W + W) % W; }
-static inline int wrapY(int y) { return (y % H + H) % H; }
+static inline int wrapX(int x) {
+    if (x < 0) return x + W;
+    if (x >= W) return x - W;
+    return x;
+}
+static inline int wrapY(int y) {
+    if (y < 0) return y + H;
+    if (y >= H) return y - H;
+    return y;
+}
 
 inline bool getCell(uint8_t *buf, int x, int y) {
     int i = idx(x, y);
@@ -99,9 +135,9 @@ inline void setCell(uint8_t *buf, int x, int y, bool v) {
 }
 
 void randomizeGrid() {
-    memset(grid, 0, sizeof(grid));
-    memset(nextGrid, 0, sizeof(nextGrid));
-    memset(age, 0, sizeof(age));
+    memset(grid, 0, GRID_BYTES);
+    memset(nextGrid, 0, GRID_BYTES);
+    memset(age, 0, GRID_W * GRID_H);
 
     for (int y = 0; y < H; y++) {
         for (int x = 0; x < W; x++) {
@@ -124,20 +160,39 @@ int countNeighbors(int x, int y) {
     return c;
 }
 
-void stepLife() {
-    for (int y = 0; y < H; y++) {
-        for (int x = 0; x < W; x++) {
-            bool alive = getCell(grid, x, y);
-            int n = countNeighbors(x, y);
-            bool nextAlive = alive ? (n == 2 || n == 3) : (n == 3);
-            setCell(nextGrid, x, y, nextAlive);
+static inline int neighbors8(int xm, int x, int xp, int ym, int y, int yp) {
+    return (int)getCell(grid, xm, ym) + getCell(grid, x, ym) + getCell(grid, xp, ym)
+         + (int)getCell(grid, xm, y)                       + getCell(grid, xp, y)
+         + (int)getCell(grid, xm, yp) + getCell(grid, x, yp) + getCell(grid, xp, yp);
+}
 
-            int i = idx(x, y);
-            if (nextAlive) age[i] = min<uint8_t>(255, age[i] + 8);
-            else           age[i] = max<uint8_t>(0, age[i] - 3);
+static inline void writeNext(int x, int y, int n) {
+    const bool alive = getCell(grid, x, y);
+    const bool nextAlive = alive ? (n == 2 || n == 3) : (n == 3);
+    setCell(nextGrid, x, y, nextAlive);
+    const int i = idx(x, y);
+    if (nextAlive) age[i] = (uint8_t)min(255, (int)age[i] + 8);
+    else           age[i] = (uint8_t)max(0, (int)age[i] - 3);
+}
+
+void stepLife() {
+    // Interior cells skip wrap checks (modulo on every neighbor was killing 1:1 fps).
+    for (int y = 1; y < H - 1; y++) {
+        for (int x = 1; x < W - 1; x++) {
+            writeNext(x, y, neighbors8(x - 1, x, x + 1, y - 1, y, y + 1));
         }
     }
-    memcpy(grid, nextGrid, sizeof(grid));
+    for (int x = 0; x < W; x++) {
+        const int xm = wrapX(x - 1), xp = wrapX(x + 1);
+        writeNext(x, 0,     neighbors8(xm, x, xp, H - 1, 0, 1));
+        writeNext(x, H - 1, neighbors8(xm, x, xp, H - 2, H - 1, 0));
+    }
+    for (int y = 1; y < H - 1; y++) {
+        const int ym = y - 1, yp = y + 1;
+        writeNext(0,     y, neighbors8(W - 1, 0, 1, ym, y, yp));
+        writeNext(W - 1, y, neighbors8(W - 2, W - 1, 0, ym, y, yp));
+    }
+    memcpy(grid, nextGrid, GRID_BYTES);
 }
 
 // HSV → RGB565
@@ -239,8 +294,26 @@ static void fillCell(int dx, int dy, int size, uint16_t color) {
     }
 }
 
-// 1x Render: each grid cell is CELL_SIZE x CELL_SIZE pixels and fills the screen.
+static void waitForDma() {
+#if defined(BOARD_FNK0104)
+    if (dmaReady) display.dmaWait();
+#endif
+}
+
+// 1x / 1:1 Render: each grid cell is CELL_SIZE x CELL_SIZE pixels and fills the screen.
 void renderToFramebuffer() {
+#if defined(BOARD_FNK0104)
+    if (CELL_SIZE == 1) {
+        for (int y = 0; y < H; y++) {
+            uint16_t *row = &framebuffer[fbIdx(0, y)];
+            for (int x = 0; x < W; x++) {
+                const bool alive = getCell(grid, x, y);
+                row[x] = alive ? styleColorAt(x, y, age[idx(x, y)]) : 0x0000;
+            }
+        }
+        return;
+    }
+#endif
     for (int y = 0; y < H; y++) {
         for (int x = 0; x < W; x++) {
             const bool alive = getCell(grid, x, y);
@@ -286,7 +359,13 @@ void renderToFramebuffer4x() {
 
 void pushFramebufferDMA() {
 #if defined(BOARD_FNK0104)
-    display.pushImage(0, 0, SCREEN_W, SCREEN_H, framebuffer);
+    if (dmaReady) {
+        display.startWrite();
+        display.pushImageDMA(0, 0, SCREEN_W, SCREEN_H, framebuffer);
+        display.endWrite();
+    } else {
+        display.pushImage(0, 0, SCREEN_W, SCREEN_H, framebuffer);
+    }
 #else
     display.startWrite();
     display.setAddrWindow(0, 0, SCREEN_W, SCREEN_H);
@@ -296,11 +375,11 @@ void pushFramebufferDMA() {
 }
 
 bool gridsEqual(uint8_t *a, uint8_t *b) {
-    return memcmp(a, b, sizeof(grid)) == 0;
+    return memcmp(a, b, GRID_BYTES) == 0;
 }
 
 bool isExtinct(uint8_t *g) {
-    for (int i = 0; i < (int)sizeof(grid); i++)
+    for (int i = 0; i < GRID_BYTES; i++)
         if (g[i] != 0) return false;
     return true;
 }
@@ -327,6 +406,15 @@ void breatheLED(float speed = 0.03f, float maxBrightness = 0.15f) {
 
     t += speed;
     if (t > 2 * PI) t -= 2 * PI;
+}
+
+// Call breatheLED at most ~20 Hz; NeoPixel updates are not free.
+static void maybeBreatheLED(float speed, float maxBrightness) {
+    static unsigned long last = 0;
+    unsigned long now = millis();
+    if (now - last < 50) return;
+    last = now;
+    breatheLED(speed, maxBrightness);
 }
 
 int lipoPercent(float v) {
@@ -416,13 +504,48 @@ void updateFPS() {
 
 static void clearHistoryFrames() {
     for (int i = 0; i < HISTORY; i++) {
-        memset(history[i], 0, sizeof(history[i]));
+        memset(historyFrame(i), 0, GRID_BYTES);
     }
     historyIndex = 0;
 }
 
+#if defined(BOARD_FNK0104)
+static void toggleFluidMode() {
+    fluidMode = !fluidMode;
+    if (fluidMode) {
+        if (!fluid.ready()) fluid.begin();
+        else fluid.reseed();
+        Serial.println("Mode: FLUID");
+    } else {
+        Serial.println("Mode: GoL");
+    }
+}
+#endif
+
 static void printControls() {
     Serial.println();
+#if defined(BOARD_FNK0104)
+    Serial.println("GoL / fluid controls:");
+    Serial.println("  r = next render (1:1, 2x zoom, 4x zoom)");
+    Serial.println("  e = next style");
+    Serial.println("  n = reseed grid (or fluid pool)");
+    Serial.println("  p = pause/resume");
+    Serial.println("  f = toggle GoL / fluid");
+    Serial.println("  i = I2C scan + IMU status");
+    Serial.println("  m = cycle IMU axis mapping");
+    Serial.println("  w/a/s/d = pan viewport (2x/4x)");
+    Serial.println("  h/? = help");
+    Serial.println("  Touch: tap = reseed (GoL) or stir (fluid)");
+    Serial.println("         long-press = pause");
+    Serial.println("         two-finger tap = toggle GoL / fluid");
+    Serial.println("         long-press a corner = toggle GoL / fluid");
+    Serial.println("         1:1 swipe L/R = style, U/D = render");
+    Serial.println("         2x/4x swipe = pan");
+    Serial.println("         in fluid, drag sets gravity (also the no-IMU fallback)");
+    Serial.println("  BOOT: short = next style (GoL) or stir (fluid)");
+    Serial.println("        double-tap = toggle GoL / fluid");
+    Serial.println("        long = next render (GoL)");
+#else
     Serial.println("GoL controls:");
     Serial.println("  r = next render");
     Serial.println("  e = next style");
@@ -430,11 +553,6 @@ static void printControls() {
     Serial.println("  p = pause/resume");
     Serial.println("  w/a/s/d = pan viewport (2x/4x)");
     Serial.println("  h/? = help");
-#if defined(HAS_TOUCH)
-    Serial.println("  Touch: tap = reseed, long-press = pause");
-    Serial.println("         1x swipe L/R = style, U/D = render");
-    Serial.println("         2x/4x swipe = pan");
-    Serial.println("  BOOT: short = next style, long = next render");
 #endif
     Serial.println();
 }
@@ -464,6 +582,13 @@ static void handleSerialControls() {
                 break;
             case 'n':
             case 'N':
+#if defined(BOARD_FNK0104)
+                if (fluidMode) {
+                    fluid.reseed();
+                    Serial.println("Reseeded fluid.");
+                    break;
+                }
+#endif
                 randomizeGrid();
                 clearHistoryFrames();
                 Serial.println("Reseeded grid.");
@@ -474,6 +599,30 @@ static void handleSerialControls() {
                 Serial.print("Paused: ");
                 Serial.println(paused ? "yes" : "no");
                 break;
+#if defined(BOARD_FNK0104)
+            case 'f':
+            case 'F':
+                toggleFluidMode();
+                break;
+            case 'i':
+            case 'I':
+                imu.scanBus();
+                if (imu.ok()) {
+                    Serial.printf("IMU %s at 0x%02X\n", imu.kindName(), imu.address());
+                    imu.printMapping();
+                    float gx, gy;
+                    bool ok = imu.read(gx, gy);
+                    Serial.printf("  gravity sample: gx=%.2f gy=%.2f %s\n",
+                                  gx, gy, ok ? "ok" : "fallback");
+                } else {
+                    Serial.println("IMU not found; fluid uses touch-drag gravity.");
+                }
+                break;
+            case 'm':
+            case 'M':
+                imu.cycleMapping();
+                break;
+#endif
             case 'w':
             case 'W':
                 viewY = wrapY(viewY - 1);
@@ -504,34 +653,44 @@ static void handleSerialControls() {
 #if defined(HAS_TOUCH)
 static bool touchReady = false;
 
-static bool readTouch(int &x, int &y) {
-    if (!touchReady) return false;
+struct TouchPoint {
+    int x, y;
+};
+
+static int readTouches(TouchPoint pts[2]) {
+    if (!touchReady) return 0;
 
     // Arduino-ESP32 3.x: avoid repeated-start (endTransmission(false)),
     // which returns ESP_ERR_INVALID_STATE on this I2C driver.
     Wire.beginTransmission(TOUCH_I2C_ADDR);
     Wire.write(0x02);
-    if (Wire.endTransmission() != 0) return false;
+    if (Wire.endTransmission() != 0) return 0;
 
-    uint8_t buf[5];
-    if (Wire.requestFrom((uint8_t)TOUCH_I2C_ADDR, (uint8_t)5) != 5) return false;
-    for (int i = 0; i < 5; i++) buf[i] = Wire.read();
+    uint8_t buf[11];
+    if (Wire.requestFrom((uint8_t)TOUCH_I2C_ADDR, (uint8_t)11) != 11) return 0;
+    for (int i = 0; i < 11; i++) buf[i] = Wire.read();
 
     int n = buf[0] & 0x0F;
-    if (n == 0) return false;
+    if (n <= 0) return 0;
+    if (n > 2) n = 2;
 
-    int rawx = ((buf[1] & 0x0F) << 8) | buf[2];
-    int rawy = ((buf[3] & 0x0F) << 8) | buf[4];
-
-    // Native panel is 240x320. Rotation 1 (landscape 320x240):
-    // x' = y, y' = (native_width - 1) - x
-    x = rawy;
-    y = 239 - rawx;
-    if (x < 0) x = 0;
-    if (y < 0) y = 0;
-    if (x >= SCREEN_W) x = SCREEN_W - 1;
-    if (y >= SCREEN_H) y = SCREEN_H - 1;
-    return true;
+    for (int i = 0; i < n; i++) {
+        // Point 1 at +1, point 2 at +7 (skip weight/misc).
+        const int off = (i == 0) ? 1 : 7;
+        int rawx = ((buf[off] & 0x0F) << 8) | buf[off + 1];
+        int rawy = ((buf[off + 2] & 0x0F) << 8) | buf[off + 3];
+        // Native panel is 240x320. Rotation 1 (landscape 320x240):
+        // x' = y, y' = (native_width - 1) - x
+        int x = rawy;
+        int y = 239 - rawx;
+        if (x < 0) x = 0;
+        if (y < 0) y = 0;
+        if (x >= SCREEN_W) x = SCREEN_W - 1;
+        if (y >= SCREEN_H) y = SCREEN_H - 1;
+        pts[i].x = x;
+        pts[i].y = y;
+    }
+    return n;
 }
 
 static void initTouch() {
@@ -551,37 +710,62 @@ static void initTouch() {
     touchReady = (Wire.endTransmission() == 0);
     Serial.print("FT6336 at 0x38: ");
     Serial.println(touchReady ? "ok" : "not found");
-    if (!touchReady) {
-        Serial.print("I2C scan:");
-        for (uint8_t addr = 1; addr < 127; addr++) {
-            Wire.beginTransmission(addr);
-            if (Wire.endTransmission() == 0) {
-                Serial.printf(" 0x%02X", addr);
-            }
-        }
-        Serial.println();
-    } else {
+    if (touchReady) {
         Wire.setClock(400000);
     }
 }
 
+static bool inCorner(int x, int y) {
+    const int m = 50;
+    return (x < m || x >= SCREEN_W - m) && (y < m || y >= SCREEN_H - m);
+}
+
 static void handleTouch() {
-    int x, y;
-    bool down = readTouch(x, y);
+    TouchPoint pts[2];
+    const int n = readTouches(pts);
+    const bool down = n > 0;
     static bool touchDown = false;
     static int touchStartX = 0, touchStartY = 0;
     static unsigned long touchStartMs = 0;
     static bool touchDidGesture = false;
+    static bool twoFinger = false;
+    static int twoStartX0 = 0, twoStartY0 = 0, twoStartX1 = 0, twoStartY1 = 0;
+
+    if (n >= 2) {
+        if (!twoFinger) {
+            twoFinger = true;
+            twoStartX0 = pts[0].x; twoStartY0 = pts[0].y;
+            twoStartX1 = pts[1].x; twoStartY1 = pts[1].y;
+            touchStartMs = millis();
+            touchDidGesture = false;
+        }
+        touchDown = true;
+        return;
+    }
 
     if (down && !touchDown) {
         touchDown = true;
-        touchStartX = x;
-        touchStartY = y;
+        twoFinger = false;
+        touchStartX = pts[0].x;
+        touchStartY = pts[0].y;
         touchStartMs = millis();
         touchDidGesture = false;
-    } else if (down && touchDown) {
-        const int dx = x - touchStartX;
-        const int dy = y - touchStartY;
+    } else if (down && touchDown && !twoFinger) {
+        const int dx = pts[0].x - touchStartX;
+        const int dy = pts[0].y - touchStartY;
+#if defined(BOARD_FNK0104)
+        if (fluidMode) {
+            // Drag / press position sets gravity (also the no-IMU fallback).
+            const float cx = (pts[0].x - SCREEN_W * 0.5f) / (SCREEN_W * 0.5f);
+            const float cy = (pts[0].y - SCREEN_H * 0.5f) / (SCREEN_H * 0.5f);
+            touchGravityX = cx;
+            touchGravityY = cy;
+            haveTouchGravity = true;
+            fluidSteering = true;
+            touchDidGesture = true;
+            return;
+        }
+#endif
         if (!touchDidGesture && (abs(dx) > 30 || abs(dy) > 30)) {
             if (currentRender == 0) {
                 touchDidGesture = true;
@@ -603,62 +787,149 @@ static void handleTouch() {
                 } else {
                     viewY = wrapY(viewY + (dy > 0 ? -step : step));
                 }
-                touchStartX = x;
-                touchStartY = y;
+                touchStartX = pts[0].x;
+                touchStartY = pts[0].y;
             }
         }
     } else if (!down && touchDown) {
-        if (!touchDidGesture) {
+        if (twoFinger) {
+            const unsigned long held = millis() - touchStartMs;
+            // A short two-finger tap toggles modes. Ignore if the fingers slid a lot.
+            const int move = abs(pts[0].x - twoStartX0) + abs(pts[0].y - twoStartY0);
+            (void)move;
+            if (held < 800) {
+#if defined(BOARD_FNK0104)
+                toggleFluidMode();
+#endif
+            }
+        } else if (!touchDidGesture) {
+            const bool corner = inCorner(touchStartX, touchStartY);
             if (millis() - touchStartMs >= 400) {
-                paused = !paused;
-                Serial.print("Paused: ");
-                Serial.println(paused ? "yes" : "no");
+#if defined(BOARD_FNK0104)
+                if (corner) {
+                    toggleFluidMode();
+                } else
+#endif
+                {
+                    paused = !paused;
+                    Serial.print("Paused: ");
+                    Serial.println(paused ? "yes" : "no");
+                }
             } else {
-                randomizeGrid();
-                clearHistoryFrames();
-                Serial.println("Reseeded grid.");
+#if defined(BOARD_FNK0104)
+                if (fluidMode) {
+                    fluid.stir();
+                    Serial.println("Stirred fluid.");
+                } else
+#endif
+                {
+                    randomizeGrid();
+                    clearHistoryFrames();
+                    Serial.println("Reseeded grid.");
+                }
             }
         }
         touchDown = false;
+        twoFinger = false;
+        fluidSteering = false;
     }
 }
 
 static void handleBootButton() {
     static bool lastUp = true;
     static unsigned long pressStart = 0;
+    static unsigned long lastShortMs = 0;
     static bool longFired = false;
+    static bool pendingShort = false;
+    static bool secondTap = false;
     const bool up = digitalRead(BOOT_BTN_PIN);   // HIGH = not pressed
     const bool pressed = !up;
+    const unsigned long now = millis();
+    const unsigned long kDoubleMs = 300;
+    const unsigned long kLongMs = 500;
 
     if (pressed && lastUp) {
-        pressStart = millis();
+        pressStart = now;
         longFired = false;
-    } else if (pressed && !longFired && (millis() - pressStart >= 500)) {
-        currentRender = (currentRender + 1) % NUM_RENDERS;
-        Serial.print("Render: ");
-        Serial.println(renderNames[currentRender]);
+        if (pendingShort && (now - lastShortMs) <= kDoubleMs) {
+            secondTap = true;
+            pendingShort = false;
+        } else {
+            secondTap = false;
+        }
+    } else if (pressed && !longFired && (now - pressStart >= kLongMs)) {
         longFired = true;
+        pendingShort = false;
+        secondTap = false;
+#if defined(BOARD_FNK0104)
+        if (!fluidMode)
+#endif
+        {
+            currentRender = (currentRender + 1) % NUM_RENDERS;
+            Serial.print("Render: ");
+            Serial.println(renderNames[currentRender]);
+        }
     } else if (!pressed && !lastUp && !longFired) {
-        currentStyle = (currentStyle + 1) % NUM_STYLES;
-        Serial.print("Style: ");
-        Serial.println(styleNames[currentStyle]);
+        if (secondTap) {
+            secondTap = false;
+            pendingShort = false;
+#if defined(BOARD_FNK0104)
+            toggleFluidMode();
+#endif
+        } else {
+            pendingShort = true;
+            lastShortMs = now;
+        }
     }
     lastUp = up;
+
+    if (pendingShort && !pressed && (now - lastShortMs >= kDoubleMs)) {
+        pendingShort = false;
+#if defined(BOARD_FNK0104)
+        if (fluidMode) {
+            fluid.stir();
+            Serial.println("Stirred fluid.");
+        } else
+#endif
+        {
+            currentStyle = (currentStyle + 1) % NUM_STYLES;
+            Serial.print("Style: ");
+            Serial.println(styleNames[currentStyle]);
+        }
+    }
 }
 #endif
 
-static bool allocFramebuffer() {
+static bool allocBuffers() {
 #if defined(BOARD_FNK0104)
-    framebuffer = (uint16_t *)heap_caps_malloc(
-        SCREEN_W * SCREEN_H * sizeof(uint16_t),
-        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!framebuffer) {
-        framebuffer = (uint16_t *)malloc(SCREEN_W * SCREEN_H * sizeof(uint16_t));
-    }
-    if (!framebuffer) {
-        Serial.println("Framebuffer alloc failed");
+    auto take = [](size_t n, bool preferInternal) -> void * {
+        void *p = nullptr;
+        if (preferInternal) {
+            p = heap_caps_malloc(n, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        }
+        if (!p) {
+            p = heap_caps_malloc(n, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        }
+        if (!p) p = malloc(n);
+        return p;
+    };
+
+    framebuffer = (uint16_t *)take(SCREEN_W * SCREEN_H * sizeof(uint16_t), false);
+    grid = (uint8_t *)take(GRID_BYTES, true);
+    nextGrid = (uint8_t *)take(GRID_BYTES, true);
+    age = (uint8_t *)take(GRID_W * GRID_H, true);
+    historyBuf = (uint8_t *)take(HISTORY * GRID_BYTES, false);
+    if (!framebuffer || !grid || !nextGrid || !age || !historyBuf) {
+        Serial.println("Buffer alloc failed");
         return false;
     }
+    memset(grid, 0, GRID_BYTES);
+    memset(nextGrid, 0, GRID_BYTES);
+    memset(age, 0, GRID_W * GRID_H);
+    Serial.printf("Buffers ok  FB=%s  free internal=%u  psram=%u\n",
+                  heap_caps_get_allocated_size(framebuffer) ? "yes" : "yes",
+                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 #endif
     return true;
 }
@@ -668,6 +939,8 @@ static void initDisplay() {
     display.init();
     display.setRotation(1);          // landscape 320x240
     display.setSwapBytes(true);
+    dmaReady = display.initDMA();
+    Serial.printf("TFT DMA: %s\n", dmaReady ? "on" : "off, using pushImage");
     display.fillScreen(TFT_BLACK);
     display.setTextColor(TFT_WHITE, TFT_BLACK);
     display.setTextDatum(MC_DATUM);
@@ -686,7 +959,7 @@ void setup() {
     Serial.begin(115200);
     delay(200);
 
-    if (!allocFramebuffer()) {
+    if (!allocBuffers()) {
         while (true) delay(1000);
     }
 
@@ -716,14 +989,26 @@ void setup() {
     initTouch();
 #endif
 
+#if defined(BOARD_FNK0104)
+    imu.begin();
+    fluid.begin();
+    wifiOtaBegin();
+#endif
+
     clearHistoryFrames();
+#if !defined(BOARD_FNK0104)
     memset(age, 0, sizeof(age));
+#endif
 
     randomSeed(esp_random());
     randomizeGrid();
     currentStyle = random(0, NUM_STYLES);
+#if defined(BOARD_FNK0104)
+    currentRender = 0;  // boot into 1:1 so the full 320x240 grid is visible
+#else
     currentRender = random(0, NUM_RENDERS);
-    delay(800);
+#endif
+    delay(400);
     Serial.println("GoL boot");
 #if defined(BOARD_FNK0104)
     Serial.println("Board: Freenove FNK0104B 2.8in ILI9341");
@@ -738,10 +1023,37 @@ void setup() {
 }
 
 void loop() {
+#if defined(BOARD_FNK0104)
+    wifiOtaPoll();
+#endif
     handleSerialControls();
 #if defined(HAS_TOUCH)
     if (touchReady) handleTouch();
     handleBootButton();
+#endif
+
+#if defined(BOARD_FNK0104)
+    if (fluidMode) {
+        if (!paused) {
+            float gx = 0.0f, gy = 1.0f;
+            const bool gotImu = imu.read(gx, gy);
+            // Live touch-drag overrides the IMU so you can steer even if the
+            // axis map is wrong. Without an IMU, the last drag (or down) is used.
+            if (fluidSteering || !gotImu) {
+                gx = haveTouchGravity ? touchGravityX : 0.0f;
+                gy = haveTouchGravity ? touchGravityY : 1.0f;
+            }
+            fluid.step(gx, gy, 1.0f / 45.0f);
+        }
+        waitForDma();
+        fluid.render(framebuffer, SCREEN_W, SCREEN_H);
+        pushFramebufferDMA();
+        updateFPS();
+        updateBattery();
+        float speed = isCharging() ? 0.70f : 0.02f;
+        maybeBreatheLED(speed, 0.10f);
+        return;
+    }
 #endif
 
     if (!paused) {
@@ -753,7 +1065,7 @@ void loop() {
 
         // Compare current grid against all history frames
         for (int i = 0; i < HISTORY; i++) {
-            if (memcmp(grid, history[i], sizeof(grid)) == 0) {
+            if (memcmp(grid, historyFrame(i), GRID_BYTES) == 0) {
                 cycleDetected = true;
                 break;
             }
@@ -763,7 +1075,9 @@ void loop() {
             randomizeGrid();
             clearHistoryFrames();
             currentStyle = random(0, NUM_STYLES);
+#if !defined(BOARD_FNK0104)
             currentRender = random(0, NUM_RENDERS);
+#endif
 
             Serial.print("Restart triggered — new style: ");
             Serial.println(styleNames[currentStyle]);
@@ -772,10 +1086,11 @@ void loop() {
         }
 
         // Store current grid into history
-        memcpy(history[historyIndex], grid, sizeof(grid));
+        memcpy(historyFrame(historyIndex), grid, GRID_BYTES);
         historyIndex = (historyIndex + 1) % HISTORY;
     }
 
+    waitForDma();
     switch (currentRender) {
         case 0: renderToFramebuffer(); break;
         case 1: renderToFramebuffer2x(); break;
@@ -784,10 +1099,12 @@ void loop() {
 
     pushFramebufferDMA();
 
-    //updateFPS();
+#if defined(BOARD_FNK0104)
+    updateFPS();
+#endif
 
     updateBattery();
 
     float speed = isCharging() ? 0.70f : 0.02f; // breathing speeds up when charging - higher = faster
-    breatheLED(speed, 0.10f);   // 10% brightness cap
+    maybeBreatheLED(speed, 0.10f);   // 10% brightness cap
 }
