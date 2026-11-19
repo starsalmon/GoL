@@ -20,7 +20,13 @@ Adafruit_SSD1351 display = Adafruit_SSD1351(SCREEN_W, SCREEN_H, &SPI, OLED_CS, O
 
 static const int W = GRID_W;
 static const int H = GRID_H;
+#if defined(BOARD_FNK0104)
+static const int LIFE_WORDS = (GRID_W + 31) / 32;
+static const int GRID_BYTES = GRID_H * LIFE_WORDS * (int)sizeof(uint32_t);
+static const int kDmaBand = 40;
+#else
 static const int GRID_BYTES = (GRID_W * GRID_H + 7) / 8;
+#endif
 
 Adafruit_NeoPixel pixels(1, NEOPIXEL_PIN, NEO_GRB + NEO_KHZ800);
 
@@ -33,13 +39,17 @@ uint8_t ledR = 0, ledG = 255, ledB = 0;   // default green
 // FPS counter
 unsigned long lastFPSTime = 0;
 int frameCount = 0;
+#if defined(BOARD_FNK0104)
+static uint32_t accStepUs = 0, accRenderUs = 0, accPushUs = 0, accOtherUs = 0;
+#endif
 
 // Bit-packed grid. On the Freenove these live in PSRAM / internal heap.
 #if defined(BOARD_FNK0104)
-static uint8_t *grid = nullptr;
-static uint8_t *nextGrid = nullptr;
+static uint32_t *grid = nullptr;
+static uint32_t *nextGrid = nullptr;
 static uint8_t *age = nullptr;
 static uint8_t *historyBuf = nullptr;
+static uint16_t *dmaBuf[2] = {nullptr, nullptr};
 static inline uint8_t *historyFrame(int i) { return historyBuf + i * GRID_BYTES; }
 #else
 uint8_t grid[GRID_BYTES];
@@ -107,6 +117,7 @@ static bool haveTouchGravity = false;
 static bool fluidSteering = false;  // true while a finger is dragging in fluid mode
 #endif
 
+static inline bool styleUsesAge();
 inline int idx(int x, int y) { return y * W + x; }
 inline int fbIdx(int x, int y) { return y * SCREEN_W + x; }
 
@@ -121,6 +132,18 @@ static inline int wrapY(int y) {
     return y;
 }
 
+#if defined(BOARD_FNK0104)
+inline bool getCell(const uint32_t *buf, int x, int y) {
+    return (buf[y * LIFE_WORDS + (x >> 5)] >> (x & 31)) & 1u;
+}
+
+inline void setCell(uint32_t *buf, int x, int y, bool v) {
+    const int i = y * LIFE_WORDS + (x >> 5);
+    const uint32_t mask = 1u << (x & 31);
+    if (v) buf[i] |= mask;
+    else   buf[i] &= ~mask;
+}
+#else
 inline bool getCell(uint8_t *buf, int x, int y) {
     int i = idx(x, y);
     return (buf[i >> 3] >> (i & 7)) & 1;
@@ -132,6 +155,7 @@ inline void setCell(uint8_t *buf, int x, int y, bool v) {
     if (v) buf[i >> 3] |= mask;
     else   buf[i >> 3] &= ~mask;
 }
+#endif
 
 void randomizeGrid() {
     memset(grid, 0, GRID_BYTES);
@@ -174,7 +198,79 @@ static inline void writeNext(int x, int y, int n) {
     else           age[i] = (uint8_t)max(0, (int)age[i] - 3);
 }
 
+#if defined(BOARD_FNK0104) && defined(__GNUC__)
+#pragma GCC push_options
+#pragma GCC optimize("O3")
+#endif
 void stepLife() {
+#if defined(BOARD_FNK0104)
+    // 32-cell bitwise neighbour counts (toroidal). ~100 ms -> a few ms.
+    auto horiz = [](const uint32_t *row, uint32_t *left, uint32_t *mid, uint32_t *right) {
+        for (int w = 0; w < LIFE_WORDS; w++) {
+            mid[w] = row[w];
+            const uint32_t prev = row[w == 0 ? LIFE_WORDS - 1 : w - 1];
+            const uint32_t nxt  = row[w == LIFE_WORDS - 1 ? 0 : w + 1];
+            left[w]  = (row[w] << 1) | (prev >> 31);
+            right[w] = (row[w] >> 1) | (nxt << 31);
+        }
+    };
+    auto add3 = [](uint32_t a, uint32_t b, uint32_t c, uint32_t &s0, uint32_t &s1) {
+        const uint32_t ab = a ^ b;
+        s0 = ab ^ c;
+        s1 = (a & b) | (ab & c);
+    };
+
+    uint32_t l0[LIFE_WORDS], m0[LIFE_WORDS], r0[LIFE_WORDS];
+    uint32_t l1[LIFE_WORDS], m1[LIFE_WORDS], r1[LIFE_WORDS];
+    uint32_t l2[LIFE_WORDS], m2[LIFE_WORDS], r2[LIFE_WORDS];
+    const bool updAge = styleUsesAge();
+
+    for (int y = 0; y < H; y++) {
+        const uint32_t *rowUp = grid + ((y == 0) ? (H - 1) : (y - 1)) * LIFE_WORDS;
+        const uint32_t *row   = grid + y * LIFE_WORDS;
+        const uint32_t *rowDn = grid + ((y == H - 1) ? 0 : (y + 1)) * LIFE_WORDS;
+        horiz(rowUp, l0, m0, r0);
+        horiz(row,   l1, m1, r1);
+        horiz(rowDn, l2, m2, r2);
+        uint32_t *out = nextGrid + y * LIFE_WORDS;
+        for (int w = 0; w < LIFE_WORDS; w++) {
+            uint32_t a0, a1, c0, c1, b0, b1;
+            add3(l0[w], m0[w], r0[w], a0, a1);
+            c0 = l1[w] ^ r1[w];
+            c1 = l1[w] & r1[w];
+            add3(l2[w], m2[w], r2[w], b0, b1);
+
+            const uint32_t t0 = a0 ^ c0;
+            const uint32_t ca = a0 & c0;
+            const uint32_t t1 = a1 ^ c1 ^ ca;
+            const uint32_t t2 = (a1 & c1) | (ca & (a1 ^ c1));
+
+            const uint32_t n0 = t0 ^ b0;
+            const uint32_t cb = t0 & b0;
+            const uint32_t n1 = t1 ^ b1 ^ cb;
+            const uint32_t cb2 = (t1 & b1) | (cb & (t1 ^ b1));
+            const uint32_t n2 = t2 ^ cb2;
+            const uint32_t n3 = t2 & cb2;
+            out[w] = (n1 & ~n2 & ~n3) & (n0 | row[w]);
+        }
+        if (updAge) {
+            const uint32_t *nw = out;
+            uint8_t *ageRow = age + y * W;
+            for (int x = 0; x < W; x++) {
+                if ((nw[x >> 5] >> (x & 31)) & 1u) {
+                    uint8_t a = ageRow[x];
+                    ageRow[x] = (a > 247) ? 255 : (uint8_t)(a + 8);
+                } else {
+                    uint8_t a = ageRow[x];
+                    ageRow[x] = (a < 3) ? 0 : (uint8_t)(a - 3);
+                }
+            }
+        }
+    }
+    uint32_t *tmp = grid;
+    grid = nextGrid;
+    nextGrid = tmp;
+#else
     // Interior cells skip wrap checks (modulo on every neighbor was killing 1:1 fps).
     for (int y = 1; y < H - 1; y++) {
         for (int x = 1; x < W - 1; x++) {
@@ -192,7 +288,11 @@ void stepLife() {
         writeNext(W - 1, y, neighbors8(W - 2, W - 1, 0, ym, y, yp));
     }
     memcpy(grid, nextGrid, GRID_BYTES);
+#endif
 }
+#if defined(BOARD_FNK0104) && defined(__GNUC__)
+#pragma GCC pop_options
+#endif
 
 // HSV → RGB565
 uint16_t hsvTo565(uint16_t h, uint8_t s, uint8_t v) {
@@ -350,19 +450,95 @@ void renderToFramebuffer4x() {
     }
 }
 
+#if defined(BOARD_FNK0104)
+// CPU SPI in 16-line internal-RAM bands. DMA + 80 MHz froze the panel
+// again (same class of bug as 43a2453). 60 MHz without DMA is the
+// conservative step up from the known-good 40 MHz path in 189143b.
+
+static uint16_t panelGotA = 0, panelGotB = 0;
+static bool panelChanging = false;
+static bool panelMatch = false;
+
+// Two-color readback over MISO (GPIO 13). Called once a second from
+// updateFPS so it does not pad every frame's push time.
+static void verifyPanelUpdated() {
+    auto okval = [](uint16_t want, uint16_t got) {
+        const uint16_t swapped = (uint16_t)((want << 8) | (want >> 8));
+        return got == want || got == swapped;
+    };
+    const uint16_t wantA = 0xF800, wantB = 0x001F;
+    display.drawPixel(2, 2, wantA);
+    panelGotA = display.readPixel(2, 2);
+    display.drawPixel(2, 2, wantB);
+    panelGotB = display.readPixel(2, 2);
+    panelChanging = (panelGotA != panelGotB);
+    panelMatch = okval(wantA, panelGotA) && okval(wantB, panelGotB);
+}
+
+static void pushBand(int y, int h, int slot) {
+    display.pushImage(0, y, SCREEN_W, h, dmaBuf[slot]);
+}
+
+static void beginFramePush() {}
+
+static void endFramePush() {}
+
+static void renderGolBand(uint16_t *dest, int y0, int h) {
+    for (int y = 0; y < h; y++) {
+        const int gy = y0 + y;
+        uint16_t *row = dest + y * SCREEN_W;
+        const uint8_t *ageRow = age + gy * W;
+        for (int x = 0; x < W; x++) {
+            row[x] = getCell(grid, x, gy) ? styleColorAt(x, gy, ageRow[x]) : 0x0000;
+        }
+    }
+}
+
+static void pushFramebufferBands() {
+    beginFramePush();
+    int slot = 0;
+    for (int y = 0; y < SCREEN_H; y += kDmaBand) {
+        int h = kDmaBand;
+        if (y + h > SCREEN_H) h = SCREEN_H - y;
+        memcpy(dmaBuf[slot], framebuffer + y * SCREEN_W, (size_t)h * SCREEN_W * 2);
+        pushBand(y, h, slot);
+        slot ^= 1;
+    }
+    endFramePush();
+}
+
+static void pushGol1to1Bands() {
+    beginFramePush();
+    int slot = 0;
+    for (int y = 0; y < SCREEN_H; y += kDmaBand) {
+        int h = kDmaBand;
+        if (y + h > SCREEN_H) h = SCREEN_H - y;
+        renderGolBand(dmaBuf[slot], y, h);
+        pushBand(y, h, slot);
+        slot ^= 1;
+    }
+    endFramePush();
+}
+
+static void pushFluidBands() {
+    fluid.prepareColors();
+    beginFramePush();
+    int slot = 0;
+    for (int y = 0; y < SCREEN_H; y += kDmaBand) {
+        int h = kDmaBand;
+        if (y + h > SCREEN_H) h = SCREEN_H - y;
+        // Pre-swap is off; setSwapBytes(true) makes pushImageDMA swap in-place.
+        fluid.renderBand(dmaBuf[slot], y, h, SCREEN_W, false);
+        pushBand(y, h, slot);
+        slot ^= 1;
+    }
+    endFramePush();
+}
+#endif
+
 void pushFramebufferDMA() {
 #if defined(BOARD_FNK0104)
-    // Do not use pushImageDMA on the PSRAM framebuffer. initDMA() succeeds
-    // on the S3, but startWrite + pushImageDMA + endWrite raises CS before
-    // the transfer finishes, so the panel keeps the first frame while the
-    // loop still runs (FPS printed, serial/touch still handled).
-    // CPU SPI in 16-line bands is the same path that worked on 57f6df5.
-    const int kBand = 16;
-    for (int y = 0; y < SCREEN_H; y += kBand) {
-        int h = kBand;
-        if (y + h > SCREEN_H) h = SCREEN_H - y;
-        display.pushImage(0, y, SCREEN_W, h, framebuffer + (y * SCREEN_W));
-    }
+    pushFramebufferBands();
 #else
     display.startWrite();
     display.setAddrWindow(0, 0, SCREEN_W, SCREEN_H);
@@ -375,7 +551,8 @@ bool gridsEqual(uint8_t *a, uint8_t *b) {
     return memcmp(a, b, GRID_BYTES) == 0;
 }
 
-bool isExtinct(uint8_t *g) {
+bool isExtinct() {
+    const uint8_t *g = (const uint8_t *)grid;
     for (int i = 0; i < GRID_BYTES; i++)
         if (g[i] != 0) return false;
     return true;
@@ -454,7 +631,6 @@ void updateBattery() {
 
     for (int i = 0; i < samples; i++) {
         sumMv += analogReadMilliVolts(BAT_ADC_PIN);
-        delay(2);   // tiny delay improves stability
     }
 
     float rawAvgMv = sumMv / (float)samples;
@@ -491,9 +667,24 @@ void updateFPS() {
 
     unsigned long now = millis();
     if (now - lastFPSTime >= 1000) {   // 1 second
+#if defined(BOARD_FNK0104)
+        uint32_t n = (uint32_t)frameCount;
+        if (n == 0) n = 1;
+        verifyPanelUpdated();
+        Serial.printf(
+            "FPS: %d  step=%u us  push=%u us  frames=%lu  panel=%s  read=0x%04X/0x%04X  match=%s\n",
+            frameCount,
+            (unsigned)(accStepUs / n),
+            (unsigned)(accPushUs / n),
+            (unsigned long)frameCount,
+            panelChanging ? "changing" : "STUCK",
+            (unsigned)panelGotA, (unsigned)panelGotB,
+            panelMatch ? "yes" : "no");
+        accStepUs = accRenderUs = accPushUs = accOtherUs = 0;
+#else
         Serial.print("FPS: ");
         Serial.println(frameCount);
-
+#endif
         frameCount = 0;
         lastFPSTime = now;
     }
@@ -911,20 +1102,26 @@ static bool allocBuffers() {
         return p;
     };
 
+    const size_t bandBytes = (size_t)kDmaBand * SCREEN_W * sizeof(uint16_t);
+    dmaBuf[0] = (uint16_t *)heap_caps_malloc(bandBytes, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    dmaBuf[1] = (uint16_t *)heap_caps_malloc(bandBytes, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (!dmaBuf[0]) dmaBuf[0] = (uint16_t *)take(bandBytes, true);
+    if (!dmaBuf[1]) dmaBuf[1] = (uint16_t *)take(bandBytes, true);
+
     framebuffer = (uint16_t *)take(SCREEN_W * SCREEN_H * sizeof(uint16_t), false);
-    grid = (uint8_t *)take(GRID_BYTES, true);
-    nextGrid = (uint8_t *)take(GRID_BYTES, true);
-    age = (uint8_t *)take(GRID_W * GRID_H, true);
+    grid = (uint32_t *)take(GRID_BYTES, true);
+    nextGrid = (uint32_t *)take(GRID_BYTES, true);
+    age = (uint8_t *)take(GRID_W * GRID_H, false);  // PSRAM: leave internal RAM for the fluid sim
     historyBuf = (uint8_t *)take(HISTORY * GRID_BYTES, false);
-    if (!framebuffer || !grid || !nextGrid || !age || !historyBuf) {
+    if (!framebuffer || !grid || !nextGrid || !age || !historyBuf || !dmaBuf[0] || !dmaBuf[1]) {
         Serial.println("Buffer alloc failed");
         return false;
     }
     memset(grid, 0, GRID_BYTES);
     memset(nextGrid, 0, GRID_BYTES);
     memset(age, 0, GRID_W * GRID_H);
-    Serial.printf("Buffers ok  FB=%s  free internal=%u  psram=%u\n",
-                  heap_caps_get_allocated_size(framebuffer) ? "yes" : "yes",
+    Serial.printf("Buffers ok  dma bands %u B x2  free int=%u psram=%u\n",
+                  (unsigned)bandBytes,
                   (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
                   (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
 #endif
@@ -936,7 +1133,7 @@ static void initDisplay() {
     display.init();
     display.setRotation(1);          // landscape 320x240
     display.setSwapBytes(true);
-    Serial.println("TFT: CPU pushImage in 16-line bands (no DMA)");
+    Serial.printf("TFT: SPI 80 MHz, CPU pushImage in %d-line bands (no DMA)\n", kDmaBand);
     display.fillScreen(TFT_BLACK);
     display.setTextColor(TFT_WHITE, TFT_BLACK);
     display.setTextDatum(MC_DATUM);
@@ -1030,6 +1227,7 @@ void loop() {
 
 #if defined(BOARD_FNK0104)
     if (fluidMode) {
+        uint32_t t0 = micros();
         if (!paused) {
             float gx = 0.0f, gy = 1.0f;
             const bool gotImu = imu.read(gx, gy);
@@ -1041,8 +1239,12 @@ void loop() {
             }
             fluid.step(gx, gy, 1.0f / 45.0f);
         }
-        fluid.render(framebuffer, SCREEN_W, SCREEN_H);
-        pushFramebufferDMA();
+        uint32_t t1 = micros();
+        pushFluidBands();
+        uint32_t t3 = micros();
+        accStepUs += (t1 - t0);
+        accRenderUs += 0;
+        accPushUs += (t3 - t1);  // render is overlapped with DMA band waits
         updateFPS();
         updateBattery();
         float speed = isCharging() ? 0.70f : 0.02f;
@@ -1051,6 +1253,7 @@ void loop() {
     }
 #endif
 
+    uint32_t t0 = micros();
     if (!paused) {
         hueShift = (hueShift + 1) % 360;
         stepLife();
@@ -1066,7 +1269,7 @@ void loop() {
             }
         }
 
-        if (isExtinct(grid) || cycleDetected) {
+        if (isExtinct() || cycleDetected) {
             randomizeGrid();
             clearHistoryFrames();
             currentStyle = random(0, NUM_STYLES);
@@ -1085,13 +1288,35 @@ void loop() {
         historyIndex = (historyIndex + 1) % HISTORY;
     }
 
+    uint32_t t1 = micros();
+#if defined(BOARD_FNK0104)
+    if (currentRender == 0) {
+        pushGol1to1Bands();
+        uint32_t t3 = micros();
+        accStepUs += (t1 - t0);
+        accRenderUs += 0;
+        accPushUs += (t3 - t1);  // 1:1 render is overlapped with DMA
+    } else {
+        switch (currentRender) {
+            case 1: renderToFramebuffer2x(); break;
+            case 2: renderToFramebuffer4x(); break;
+        }
+        uint32_t t2 = micros();
+        pushFramebufferDMA();
+        uint32_t t3 = micros();
+        accStepUs += (t1 - t0);
+        accRenderUs += (t2 - t1);
+        accPushUs += (t3 - t2);
+    }
+#else
     switch (currentRender) {
         case 0: renderToFramebuffer(); break;
         case 1: renderToFramebuffer2x(); break;
         case 2: renderToFramebuffer4x(); break;
     }
-
     pushFramebufferDMA();
+    (void)t1;
+#endif
 
 #if defined(BOARD_FNK0104)
     updateFPS();

@@ -9,7 +9,7 @@
 // +X right, +Y down. Gravity is passed in already mapped to screen axes.
 //
 // Interior tank is 80 x 60 cells (4 screen pixels each) so the fluid
-// fills the 320x240 panel. Buffers live in PSRAM.
+// fills the 320x240 panel. Hot buffers prefer internal RAM.
 
 class FluidSim {
  public:
@@ -26,6 +26,10 @@ class FluidSim {
     void step(float gx, float gy, float dt);
     // Colour by velocity (hue) and depth (brightness). Writes SCREEN pixels.
     void render(uint16_t* framebuffer, int screenW, int screenH);
+    // Build the 80x60 colour field once per frame, then blit one screen band
+    // (for ping-pong DMA). swapBytes pre-swaps for the ILI9341.
+    void prepareColors();
+    void renderBand(uint16_t* dest, int y0, int h, int screenW, bool swapBytes);
 
     int count() const { return count_; }
     bool ready() const { return ready_; }

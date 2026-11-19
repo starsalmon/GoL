@@ -3,7 +3,7 @@
 #if defined(BOARD_FNK0104)
 
 #if defined(__GNUC__) && !defined(__clang__)
-#pragma GCC optimize("O2")
+#pragma GCC optimize("O3")
 #endif
 
 #include "fluid_sim.h"
@@ -22,7 +22,7 @@ const int SOLID = 2;
 const float kParticleRadius = 0.46f;
 const float kGravityAccel = 160.0f;   // cells / s^2 at 1 g (~640 px/s^2)
 const float kMaxSpeed = 48.0f;        // 0.8 cell per 1/60 s frame
-const int kPressureIters = 12;
+const int kPressureIters = 6;
 const int kSeparateIters = 2;
 const float kInvOpen[5] = {0.0f, 1.0f, 0.5f, 1.0f / 3.0f, 0.25f};
 const float kTinyD2 = 1.0e-8f;
@@ -59,8 +59,12 @@ inline float halfGapOverDist(float d2, float minDist) {
     return 0.5f * (minDist - d) / d;
 }
 
-void* allocPsram(size_t n) {
-    void* p = heap_caps_malloc(n, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+void* allocMem(size_t n, bool internalFirst) {
+    void* p = nullptr;
+    if (internalFirst) {
+        p = heap_caps_malloc(n, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    }
+    if (!p) p = heap_caps_malloc(n, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!p) p = malloc(n);
     return p;
 }
@@ -87,32 +91,36 @@ uint16_t hsvTo565(uint16_t h, uint8_t s, uint8_t v) {
 }  // namespace
 
 bool FluidSim::begin(int particleCount, float flipRatio) {
-    auto take = [](void** slot, size_t n) -> bool {
-        *slot = allocPsram(n);
+    auto take = [](void** slot, size_t n, bool internal) -> bool {
+        *slot = allocMem(n, internal);
         return *slot != nullptr;
     };
     if (!u_) {
         bool ok = true;
-        ok = ok && take((void**)&u_, sizeof(float) * kCells);
-        ok = ok && take((void**)&v_, sizeof(float) * kCells);
-        ok = ok && take((void**)&prevU_, sizeof(float) * kCells);
-        ok = ok && take((void**)&prevV_, sizeof(float) * kCells);
-        ok = ok && take((void**)&du_, sizeof(float) * kCells);
-        ok = ok && take((void**)&dv_, sizeof(float) * kCells);
-        ok = ok && take((void**)&density_, sizeof(float) * kCells);
-        ok = ok && take((void**)&solid_, kCells);
-        ok = ok && take((void**)&cellType_, kCells);
-        ok = ok && take((void**)&px_, sizeof(float) * kMaxParticles);
-        ok = ok && take((void**)&py_, sizeof(float) * kMaxParticles);
-        ok = ok && take((void**)&pvx_, sizeof(float) * kMaxParticles);
-        ok = ok && take((void**)&pvy_, sizeof(float) * kMaxParticles);
+        auto hot = [&](void** slot, size_t n) { return take(slot, n, true); };
+        auto cold = [&](void** slot, size_t n) { return take(slot, n, false); };
+        ok = ok && hot((void**)&u_, sizeof(float) * kCells);
+        ok = ok && hot((void**)&v_, sizeof(float) * kCells);
+        ok = ok && hot((void**)&prevU_, sizeof(float) * kCells);
+        ok = ok && hot((void**)&prevV_, sizeof(float) * kCells);
+        ok = ok && hot((void**)&du_, sizeof(float) * kCells);
+        ok = ok && hot((void**)&dv_, sizeof(float) * kCells);
+        ok = ok && hot((void**)&density_, sizeof(float) * kCells);
+        ok = ok && hot((void**)&solid_, kCells);
+        ok = ok && hot((void**)&cellType_, kCells);
+        ok = ok && hot((void**)&px_, sizeof(float) * kMaxParticles);
+        ok = ok && hot((void**)&py_, sizeof(float) * kMaxParticles);
+        ok = ok && hot((void**)&pvx_, sizeof(float) * kMaxParticles);
+        ok = ok && hot((void**)&pvy_, sizeof(float) * kMaxParticles);
         const int hashX = kNX + 1;
         const int hashY = kNY + 1;
         const int hashCells = hashX * hashY;
-        ok = ok && take((void**)&numCell_, sizeof(int) * hashCells);
-        ok = ok && take((void**)&firstCell_, sizeof(int) * (hashCells + 1));
-        ok = ok && take((void**)&cellIds_, sizeof(int) * kMaxParticles);
-        ok = ok && take((void**)&cellColor_, sizeof(uint16_t) * kInteriorX * kInteriorY);
+        // Hash tables are the pushApart hot path once the puddle packs.
+        // cellColor is only touched at render time, so it can live in PSRAM.
+        ok = ok && hot((void**)&numCell_, sizeof(int) * hashCells);
+        ok = ok && hot((void**)&firstCell_, sizeof(int) * (hashCells + 1));
+        ok = ok && hot((void**)&cellIds_, sizeof(int) * kMaxParticles);
+        ok = ok && cold((void**)&cellColor_, sizeof(uint16_t) * kInteriorX * kInteriorY);
         if (!ok) {
             Serial.println("Fluid sim alloc failed");
             ready_ = false;
@@ -159,8 +167,10 @@ bool FluidSim::begin(int particleCount, float flipRatio) {
     seedCount_ = particleCount;
     seed(particleCount);
     ready_ = true;
-    Serial.printf("Fluid sim ready: %d particles, %dx%d MAC grid\n",
-                  count_, kInteriorX, kInteriorY);
+    Serial.printf("Fluid sim ready: %d particles, %dx%d MAC grid (pressure %d, free int=%u psram=%u)\n",
+                  count_, kInteriorX, kInteriorY, kPressureIters,
+                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
     return true;
 }
 
@@ -515,13 +525,9 @@ void FluidSim::transferToParticles() {
     for (int i = 0; i < count_; ++i) clampSpeed(pvx_[i], pvy_[i], kMaxSpeed);
 }
 
-void FluidSim::render(uint16_t* framebuffer, int screenW, int screenH) {
-    if (!ready_ || !framebuffer) return;
+void FluidSim::prepareColors() {
     const float rest = restDensity_ > 0.0f ? restDensity_ : 1.0f;
     const float invRest = 1.0f / rest;
-    const float scaleX = (float)screenW / (float)kInteriorX;
-    const float scaleY = (float)screenH / (float)kInteriorY;
-
     for (int i = 0; i < kInteriorX; ++i) {
         for (int j = 0; j < kInteriorY; ++j) {
             const int c = idx(i + 1, j + 1);
@@ -529,7 +535,6 @@ void FluidSim::render(uint16_t* framebuffer, int screenW, int screenH) {
             const float speed = sqrtf(u_[c] * u_[c] + v_[c] * v_[c]);
             uint16_t color = 0;
             if (d > 0.08f) {
-                // Blue water, shifting cyan/yellow with speed, brighter when deeper.
                 int hue = 210 - (int)clampf(speed * 8.0f, 0.0f, 80.0f);
                 if (hue < 0) hue += 360;
                 uint8_t sat = (uint8_t)(255.0f - clampf(speed * 12.0f, 0.0f, 140.0f));
@@ -539,44 +544,59 @@ void FluidSim::render(uint16_t* framebuffer, int screenW, int screenH) {
             cellColor_[j * kInteriorX + i] = color;
         }
     }
+}
 
-    // Nearest-neighbour upsample (4x) — cheap and sharp on a 2.8" panel.
-    const int pixX = (int)(scaleX + 0.5f);
-    const int pixY = (int)(scaleY + 0.5f);
-    for (int j = 0; j < kInteriorY; ++j) {
-        for (int py = 0; py < pixY; ++py) {
-            const int y = j * pixY + py;
-            if (y >= screenH) continue;
-            uint16_t* row = framebuffer + y * screenW;
-            for (int i = 0; i < kInteriorX; ++i) {
-                const uint16_t color = cellColor_[j * kInteriorX + i];
-                const int x0 = i * pixX;
-                for (int px = 0; px < pixX; ++px) {
-                    const int x = x0 + px;
-                    if (x < screenW) row[x] = color;
-                }
-            }
+void FluidSim::renderBand(uint16_t* dest, int y0, int h, int screenW, bool swapBytes) {
+    const int pixX = 4;
+    const int pixY = 4;
+    const int y1 = y0 + h;
+    for (int y = y0; y < y1; ++y) {
+        const int j = y / pixY;
+        uint16_t* row = dest + (y - y0) * screenW;
+        if ((unsigned)j >= (unsigned)kInteriorY) {
+            memset(row, 0, screenW * 2);
+            continue;
+        }
+        const uint16_t* src = &cellColor_[j * kInteriorX];
+        for (int i = 0; i < kInteriorX; ++i) {
+            uint16_t color = src[i];
+            if (swapBytes) color = (uint16_t)((color << 8) | (color >> 8));
+            const int x0 = i * pixX;
+            row[x0] = color;
+            row[x0 + 1] = color;
+            row[x0 + 2] = color;
+            row[x0 + 3] = color;
         }
     }
 
-    // Particle highlights so spray and the free surface stay visible.
+    const float scaleX = 4.0f;
+    const float scaleY = 4.0f;
     for (int p = 0; p < count_; ++p) {
         const int x = (int)((px_[p] - 1.0f) * scaleX);
         const int y = (int)((py_[p] - 1.0f) * scaleY);
-        if ((unsigned)x >= (unsigned)screenW || (unsigned)y >= (unsigned)screenH) continue;
+        if (y < y0 || y >= y1) continue;
+        if ((unsigned)x >= (unsigned)screenW) continue;
         const float speed = sqrtf(pvx_[p] * pvx_[p] + pvy_[p] * pvy_[p]);
         uint8_t add = (uint8_t)clampf(80.0f + speed * 6.0f, 80.0f, 255.0f);
-        uint16_t* pix = &framebuffer[y * screenW + x];
-        // Lighten the pixel toward white without a full RGB convert.
+        uint16_t* pix = &dest[(y - y0) * screenW + x];
         uint16_t c = *pix;
+        if (swapBytes) c = (uint16_t)((c << 8) | (c >> 8));
         int r = (c >> 11) & 0x1F;
         int g = (c >> 5) & 0x3F;
         int b = c & 0x1F;
         r = r + ((31 - r) * add) / 400;
         g = g + ((63 - g) * add) / 400;
         b = b + ((31 - b) * add) / 400;
-        *pix = (uint16_t)((r << 11) | (g << 5) | b);
+        uint16_t out = (uint16_t)((r << 11) | (g << 5) | b);
+        if (swapBytes) out = (uint16_t)((out << 8) | (out >> 8));
+        *pix = out;
     }
+}
+
+void FluidSim::render(uint16_t* framebuffer, int screenW, int screenH) {
+    if (!ready_ || !framebuffer) return;
+    prepareColors();
+    renderBand(framebuffer, 0, screenH, screenW, false);
 }
 
 #endif  // BOARD_FNK0104

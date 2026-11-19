@@ -66,6 +66,11 @@ static void startOta() {
 
 void wifiOtaPoll() {
     if (!started_) return;
+    // Do not run the Wi-Fi/OTA work on every animation frame.
+    static uint32_t lastMs = 0;
+    uint32_t now = millis();
+    if ((uint32_t)(now - lastMs) < 20 && otaBegun_) return;
+    lastMs = now;
 
     if (WiFi.status() == WL_CONNECTED) {
         if (!loggedIp_) {
