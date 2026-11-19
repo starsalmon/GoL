@@ -83,7 +83,7 @@ The Game of Life grid fills the 320×240 landscape screen at **1:1** (one pixel 
 - In **2× / 4×** mode, swipe to pan the viewport
 - In **fluid** mode, drag to set gravity (also the fallback when no IMU is present)
 - **BOOT**: short press = next style (GoL) or stir (fluid); **double-tap** = toggle GoL / fluid; long press = next render (GoL)
-- Serial: `r` render, `e` style, `n` reseed, `p` pause, `f` toggle fluid, `i` I2C/IMU scan, `m` cycle IMU axis map, `w/a/s/d` pan, `h` help (115200 baud)
+- Serial: `r` render, `e` style, `n` reseed, `p` pause, `f` toggle fluid, `i` I2C/IMU scan + raw accel, `m` cycle IMU axis map, `x` flip screen-X sign, `w/a/s/d` pan, `h` help (115200 baud)
 
 The onboard WS2812 (GPIO 42) is the battery / breathing LED. Backlight is GPIO 45 (active HIGH). There is no dedicated 5V-sense pin on this board, so the LED does not speed up when charging.
 

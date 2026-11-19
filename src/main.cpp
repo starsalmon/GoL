@@ -514,7 +514,7 @@ static void fluidSimTask(void *) {
         const float gy = fluidGy;
         const uint32_t t0 = micros();
         fluid.step(gx, gy, 1.0f / 30.0f);
-        fluid.prepareColors(fluidColor[back]);
+        fluid.prepareView(fluidColor[back], FluidSim::kViewW, FluidSim::kViewH);
         const uint32_t dt = micros() - t0;
 
         // Publish: swap only when the current front is no longer in use,
@@ -534,6 +534,9 @@ static void fluidSimTask(void *) {
         }
         fluidAccStepUs += dt;
         fluidAccSteps += 1;
+        // Yield so IDLE0 can pet the watchdog. A tight step+upsample
+        // loop on core 0 otherwise starves it.
+        vTaskDelay(1);
     }
 }
 
@@ -593,17 +596,33 @@ static void pushGol1to1Bands() {
     endFramePush();
 }
 
-static void pushFluidBands(const uint16_t *colors) {
-    beginFramePush();
-    int slot = 0;
+static void pushFluidBands(const uint16_t *view) {
+    // view is 160x120. Expand 2x into a fully written 40-line band, then
+    // pushImage. No DMA. Every pixel in the band is written before the push
+    // so stale buffer contents cannot show as black blocks.
+    const int vw = FluidSim::kViewW;
+    const int vh = FluidSim::kViewH;
+    const int xScale = SCREEN_W / vw;   // 2
+    const int yScale = SCREEN_H / vh;   // 2
     for (int y = 0; y < SCREEN_H; y += kDmaBand) {
         int h = kDmaBand;
         if (y + h > SCREEN_H) h = SCREEN_H - y;
-        fluid.renderBand(dmaBuf[slot], y, h, SCREEN_W, false, colors);
-        pushBand(y, h, slot);
-        slot ^= 1;
+        uint16_t *dest = dmaBuf[0];
+        memset(dest, 0, (size_t)h * SCREEN_W * sizeof(uint16_t));
+        for (int row = 0; row < h; ++row) {
+            const int sy = (y + row) / yScale;
+            if ((unsigned)sy >= (unsigned)vh) continue;
+            const uint16_t *src = view + sy * vw;
+            uint16_t *out = dest + row * SCREEN_W;
+            for (int sx = 0; sx < vw; ++sx) {
+                const uint16_t c = src[sx];
+                const int x0 = sx * xScale;
+                out[x0] = c;
+                if (xScale > 1) out[x0 + 1] = c;
+            }
+        }
+        display.pushImage(0, y, SCREEN_W, h, dest);
     }
-    endFramePush();
 }
 #endif
 
@@ -794,8 +813,9 @@ static void printControls() {
     Serial.println("  n = reseed grid (or fluid pool)");
     Serial.println("  p = pause/resume");
     Serial.println("  f = toggle GoL / fluid");
-    Serial.println("  i = I2C scan + IMU status");
+    Serial.println("  i = I2C scan + IMU status + raw accel");
     Serial.println("  m = cycle IMU axis mapping");
+    Serial.println("  x = flip IMU screen-X sign only");
     Serial.println("  w/a/s/d = pan viewport (2x/4x)");
     Serial.println("  h/? = help");
     Serial.println("  Touch: tap = reseed (GoL) or stir (fluid)");
@@ -873,7 +893,11 @@ static void handleSerialControls() {
                 if (imu.ok()) {
                     Serial.printf("IMU %s at 0x%02X\n", imu.kindName(), imu.address());
                     imu.printMapping();
-                    float gx, gy;
+                    float ax, ay, az, gx, gy;
+                    if (imu.readRaw(ax, ay, az)) {
+                        Serial.printf("  raw accel: ax=%.3f ay=%.3f az=%.3f g\n",
+                                      ax, ay, az);
+                    }
                     bool ok = imu.read(gx, gy);
                     Serial.printf("  gravity sample: gx=%.2f gy=%.2f %s\n",
                                   gx, gy, ok ? "ok" : "fallback");
@@ -884,6 +908,10 @@ static void handleSerialControls() {
             case 'm':
             case 'M':
                 imu.cycleMapping();
+                break;
+            case 'x':
+            case 'X':
+                imu.flipX();
                 break;
 #endif
             case 'w':
@@ -1182,7 +1210,7 @@ static bool allocBuffers() {
     dmaBuf[1] = (uint16_t *)heap_caps_malloc(bandBytes, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     if (!dmaBuf[0]) dmaBuf[0] = (uint16_t *)take(bandBytes, true);
     if (!dmaBuf[1]) dmaBuf[1] = (uint16_t *)take(bandBytes, true);
-    const size_t colorBytes = (size_t)FluidSim::kInteriorX * FluidSim::kInteriorY * sizeof(uint16_t);
+    const size_t colorBytes = (size_t)FluidSim::kViewW * FluidSim::kViewH * sizeof(uint16_t);
     fluidColor[0] = (uint16_t *)take(colorBytes, false);
     fluidColor[1] = (uint16_t *)take(colorBytes, false);
 
@@ -1264,6 +1292,15 @@ void setup() {
 
 #if defined(BOARD_FNK0104)
     imu.begin();
+    for (int i = 0; i < 5; ++i) {
+        float ax, ay, az;
+        if (imu.readRaw(ax, ay, az)) {
+            Serial.printf("IMU raw accel[%d]: ax=%.3f ay=%.3f az=%.3f g\n", i, ax, ay, az);
+        } else {
+            Serial.printf("IMU raw accel[%d]: (read failed)\n", i);
+        }
+        delay(20);
+    }
     fluid.begin();
     startFluidTask();
     wifiOtaBegin();

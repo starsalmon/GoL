@@ -93,23 +93,29 @@ float clampf(float v, float lo, float hi) {
     return v;
 }
 
-// axis: 0=X 1=Y 2=Z, sign ±1. Twelve common board orientations.
-// Map 0 is the default: screenX=+X, screenY=-Y (flipped Y; "flip y").
+// axis: 0=X 1=Y 2=Z, sign ±1.
+// The IMU is mounted on its edge: IMU X is the screen normal (ignored
+// by the default map), IMU Y is screen Y, IMU Z is screen X.
+// Map 0: screenX=+Z, screenY=-Y. Serial 'x' flips only the X sign.
 const int kMaps[][4] = {
-    {0, 1,  1, -1},
-    {0, 1, -1,  1},
-    {0, 1,  1,  1},
-    {0, 1, -1, -1},
+    {2, 1,  1, -1},  // default: +Z, -Y
+    {2, 1, -1, -1},  // -Z, -Y
+    {2, 1,  1,  1},  // +Z, +Y
+    {2, 1, -1,  1},  // -Z, +Y
+    {0, 1,  1, -1},  // +X, -Y
+    {0, 1, -1, -1},  // -X, -Y
+    {0, 1,  1,  1},  // +X, +Y
+    {0, 1, -1,  1},  // -X, +Y
     {1, 0,  1,  1},
     {1, 0, -1,  1},
     {1, 0,  1, -1},
     {1, 0, -1, -1},
-    {0, 2,  1,  1},
-    {0, 2, -1,  1},
-    {0, 2,  1, -1},
-    {0, 2, -1, -1},
+    {2, 0,  1,  1},  // Z/X swaps, in case the module is rotated
+    {2, 0, -1,  1},
+    {2, 0,  1, -1},
+    {2, 0, -1, -1},
 };
-const int kMapCount = 12;
+const int kMapCount = 16;
 
 float pick(float x, float y, float z, int axis) {
     if (axis == 0) return x;
@@ -160,6 +166,8 @@ void Imu::begin() {
     addr_ = 0;
     fails_ = 0;
     haveSmooth_ = false;
+    haveRaw_ = false;
+    xSign_ = 1;
     smoothX_ = 0.0f;
     smoothY_ = 1.0f;
 
@@ -299,7 +307,7 @@ bool Imu::readAccel(float& ax, float& ay, float& az) {
 
 void Imu::mapToScreen(float ax, float ay, float az, float& gx, float& gy) const {
     const int* m = kMaps[mapIndex_];
-    gx = pick(ax, ay, az, m[0]) * (float)m[2];
+    gx = pick(ax, ay, az, m[0]) * (float)m[2] * (float)xSign_;
     gy = pick(ax, ay, az, m[1]) * (float)m[3];
 }
 
@@ -309,13 +317,33 @@ void Imu::cycleMapping() {
     printMapping();
 }
 
+void Imu::flipX() {
+    xSign_ = -xSign_;
+    haveSmooth_ = false;
+    printMapping();
+}
+
 void Imu::printMapping() const {
     const int* m = kMaps[mapIndex_];
     const char axis[] = {'X', 'Y', 'Z'};
+    const int xSign = m[2] * xSign_;
     Serial.printf("IMU map %d: screenX=%c%c  screenY=%c%c\n",
                   mapIndex_,
-                  m[2] < 0 ? '-' : '+', axis[m[0]],
+                  xSign < 0 ? '-' : '+', axis[m[0]],
                   m[3] < 0 ? '-' : '+', axis[m[1]]);
+}
+
+bool Imu::lastRaw(float& ax, float& ay, float& az) const {
+    if (!haveRaw_) return false;
+    ax = rawX_; ay = rawY_; az = rawZ_;
+    return true;
+}
+
+bool Imu::readRaw(float& ax, float& ay, float& az) {
+    if (!ok_ || !readAccel(ax, ay, az)) return false;
+    rawX_ = ax; rawY_ = ay; rawZ_ = az;
+    haveRaw_ = true;
+    return true;
 }
 
 bool Imu::read(float& gx, float& gy) {
@@ -340,6 +368,8 @@ bool Imu::read(float& gx, float& gy) {
         return false;
     }
     fails_ = 0;
+    rawX_ = ax; rawY_ = ay; rawZ_ = az;
+    haveRaw_ = true;
 
     float sx, sy;
     mapToScreen(ax, ay, az, sx, sy);

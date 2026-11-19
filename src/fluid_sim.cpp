@@ -552,8 +552,10 @@ void FluidSim::prepareColors(uint16_t* dest) {
     for (int i = 0; i < kInteriorX; ++i) {
         for (int j = 0; j < kInteriorY; ++j) {
             const int c = idx(i + 1, j + 1);
-            const float d = density_[c] * invRest;
-            const float speed = sqrtf(u_[c] * u_[c] + v_[c] * v_[c]);
+            float d = density_[c] * invRest;
+            float speed = sqrtf(u_[c] * u_[c] + v_[c] * v_[c]);
+            if (!isfinite(d)) d = 0.0f;
+            if (!isfinite(speed)) speed = 0.0f;
             uint16_t color = 0;
             if (d > 0.08f) {
                 int hue = 210 - (int)clampf(speed * 8.0f, 0.0f, 80.0f);
@@ -577,6 +579,35 @@ static inline uint16_t lerp565(uint16_t a, uint16_t b, int t) {
     const int g = (ga * u + gb * t) >> 8;
     const int bl = (ba * u + bb * t) >> 8;
     return (uint16_t)((r << 11) | (g << 5) | bl);
+}
+
+void FluidSim::prepareView(uint16_t* dest, int viewW, int viewH) {
+    if (!dest || viewW < 2 || viewH < 2) return;
+    prepareColors(cellColor_);
+    if (!cellColor_) return;
+    const int gw = kInteriorX;
+    const int gh = kInteriorY;
+    const int maxfX = (gw - 1) * 256 - 1;
+    const int maxfY = (gh - 1) * 256 - 1;
+    for (int y = 0; y < viewH; ++y) {
+        int fy = (int)(((y + 0.5f) * gh / (float)viewH - 0.5f) * 256.0f);
+        if (fy < 0) fy = 0;
+        if (fy > maxfY) fy = maxfY;
+        const uint16_t* r0 = cellColor_ + (size_t)(fy >> 8) * gw;
+        const uint16_t* r1 = r0 + gw;
+        const int wy = fy & 255;
+        uint16_t* row = dest + (size_t)y * viewW;
+        for (int x = 0; x < viewW; ++x) {
+            int fx = (int)(((x + 0.5f) * gw / (float)viewW - 0.5f) * 256.0f);
+            if (fx < 0) fx = 0;
+            if (fx > maxfX) fx = maxfX;
+            const int i = fx >> 8;
+            const int wx = fx & 255;
+            const uint16_t top = lerp565(r0[i], r0[i + 1], wx);
+            const uint16_t bot = lerp565(r1[i], r1[i + 1], wx);
+            row[x] = lerp565(top, bot, wy);
+        }
+    }
 }
 
 void FluidSim::renderBand(uint16_t* dest, int y0, int h, int screenW, bool swapBytes,

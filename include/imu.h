@@ -32,6 +32,11 @@ class Imu {
     // Cycle through common axis mappings (serial 'm').
     void cycleMapping();
     void printMapping() const;
+    // Toggle only the screen-X sign (serial 'x'), leaving screen Y alone.
+    void flipX();
+    // Last raw accelerometer sample in g. False if no successful raw read yet.
+    bool lastRaw(float& ax, float& ay, float& az) const;
+    bool readRaw(float& ax, float& ay, float& az);
 
  private:
     bool ok_ = false;
@@ -39,9 +44,12 @@ class Imu {
     uint8_t addr_ = 0;
     int fails_ = 0;
     int mapIndex_ = 0;
+    int xSign_ = 1;  // extra screen-X flip, applied after the map
     float smoothX_ = 0.0f;
     float smoothY_ = 1.0f;
     bool haveSmooth_ = false;
+    float rawX_ = 0.0f, rawY_ = 0.0f, rawZ_ = 0.0f;
+    bool haveRaw_ = false;
 
     bool probeAddress(uint8_t addr, bool log);
     bool configure();

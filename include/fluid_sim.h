@@ -21,6 +21,8 @@ class FluidSim {
     static const int kInteriorY = 48;
     static const int kCells = kNX * kNY;
     static const int kMaxParticles = 1800;
+    static const int kViewW = 160;       // published colour field (2x2 on screen)
+    static const int kViewH = 120;
 
     bool begin(int particleCount = 1600, float flipRatio = 0.90f);
     void reseed();
@@ -30,8 +32,11 @@ class FluidSim {
     void render(uint16_t* framebuffer, int screenW, int screenH);
     // Build the 64x48 colour field into dest (or the internal buffer).
     void prepareColors(uint16_t* dest = nullptr);
-    // Blit one screen band, bilinear-upsampled to 2x2 pixel blocks
-    // (yoRadio screensaver style). swapBytes pre-swaps for the ILI9341.
+    // Bilinear-upsample the 64x48 field into a 160x120 snapshot for the
+    // display task. The display then does a cheap 2x nearest expand.
+    void prepareView(uint16_t* dest, int viewW = kViewW, int viewH = kViewH);
+    // Blit one screen band from a 160x120 view (2x2 nearest) or, if colors
+    // is a 64x48 field, bilinear-upsample. swapBytes pre-swaps for ILI9341.
     void renderBand(uint16_t* dest, int y0, int h, int screenW, bool swapBytes,
                     const uint16_t* colors = nullptr);
 
